@@ -1,28 +1,35 @@
-# 必要なライブラリをインポート
 import os, boto3, json
 import streamlit as st
+from dotenv import load_dotenv
 
-# secrets.toml が読めてないと st.user に属性が生えないので、先に検知して落とす
+######################################
+# 環境変数と認証の設定
+######################################
+load_dotenv()
+REGION = os.getenv("AWS_REGION")
+AGENT_RUNTIME_ARN = os.getenv("AGENT_RUNTIME_ARN")
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+
 if "auth" not in st.secrets:
     st.error("`.streamlit/secrets.toml` が読み込めていません（[auth] が見つからない）。配置場所とファイル名を確認してください。")
     st.stop()
 
-# 旧APIは捨てて st.user を使う
 if not getattr(st.user, "is_logged_in", False):
     st.login("auth0") 
     st.stop()
 
-st.success(f"Hello, {st.user.name}!")
-if st.button("Log out"):
+
+
+# メニューバー（サイドバー）に「ようこそxxさん」とログアウトボタンを表示
+with st.sidebar:
+  st.markdown(f"<h3 style='margin-bottom:0;'>ようこそ {st.user.name} さん</h3>", unsafe_allow_html=True)
+  if st.button("ログアウト", key="logout_btn_sidebar"):
     st.logout()
 
-
-REGION = os.getenv("AWS_REGION")
-agent_runtime_arn = os.getenv("AGENT_RUNTIME_ARN")
-AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-
-# タイトルを描画
+######################################
+# StreamlitアプリのUI構築
+######################################
 st.title("インフルエンサー検索エージェント")
 st.write("Youtube APIを使用してインフルエンサーの情報収集します！")
 st.write("「登録者数〇万人から〇万人までの〇〇系Youtuberを検索して」といったリクエストに対応します。")
@@ -40,7 +47,7 @@ if prompt := st.chat_input("メッセージを入力してね"):
         agentcore = boto3.client('bedrock-agentcore', region_name=REGION)
         payload = json.dumps({"prompt": prompt})
         response = agentcore.invoke_agent_runtime(
-            agentRuntimeArn=agent_runtime_arn,
+            agentRuntimeArn=AGENT_RUNTIME_ARN,
             payload=payload.encode()
         )
 
@@ -84,5 +91,4 @@ if prompt := st.chat_input("メッセージを入力してね"):
 
         # 最後に残ったテキストを表示
         text_holder.markdown(buffer)
-        ### ------------------------------------------------------------------------------
-
+        ### ここから上はストリーミングレスポンスの処理 ------------------------------------------
