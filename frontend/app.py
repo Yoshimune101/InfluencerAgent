@@ -4,11 +4,14 @@ import streamlit as st
 
 REGION = os.getenv("AWS_REGION")
 agent_runtime_arn = os.getenv("AGENT_RUNTIME_ARN")
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 
 # タイトルを描画
 st.title("インフルエンサー検索エージェント")
 st.write("Youtube APIを使用してインフルエンサーの情報収集します！")
 st.write("「登録者数〇万人から〇万人までの〇〇系Youtuberを検索して」といったリクエストに対応します。")
+st.write("例：ビールを売るために、登録者数1万人から5万人までのグルメ系Youtuberを教えて")
 
 # チャットボックスを描画
 if prompt := st.chat_input("メッセージを入力してね"):
