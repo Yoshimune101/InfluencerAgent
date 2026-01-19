@@ -2,6 +2,21 @@
 import os, boto3, json
 import streamlit as st
 
+# secrets.toml が読めてないと st.user に属性が生えないので、先に検知して落とす
+if "auth" not in st.secrets:
+    st.error("`.streamlit/secrets.toml` が読み込めていません（[auth] が見つからない）。配置場所とファイル名を確認してください。")
+    st.stop()
+
+# 旧APIは捨てて st.user を使う
+if not getattr(st.user, "is_logged_in", False):
+    st.login("auth0") 
+    st.stop()
+
+st.success(f"Hello, {st.user.name}!")
+if st.button("Log out"):
+    st.logout()
+
+
 REGION = os.getenv("AWS_REGION")
 agent_runtime_arn = os.getenv("AGENT_RUNTIME_ARN")
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
