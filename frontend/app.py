@@ -8,7 +8,7 @@ agent_runtime_arn = os.getenv("AGENT_RUNTIME_ARN")
 # タイトルを描画
 st.title("インフルエンサー検索エージェント")
 st.write("Youtube APIを使用してインフルエンサーの情報収集します！")
-st.write("「登録者数〇万人から〇万人までのYoutuberを検索して」といったリクエストに対応します。")
+st.write("「登録者数〇万人から〇万人までの〇〇系Youtuberを検索して」といったリクエストに対応します。")
 
 # チャットボックスを描画
 if prompt := st.chat_input("メッセージを入力してね"):
