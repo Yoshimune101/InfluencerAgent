@@ -5,8 +5,8 @@ from dotenv import load_dotenv
 ######################################
 # ログイン
 #######################################
-if not getattr(st.user, "is_logged_in", False):
-    st.login()   # ← これだけでログイン画面
+if not st.user.is_logged_in:
+    st.login("auth0")
     st.stop()
 
 st.success(f"Hello {st.user.name}")
