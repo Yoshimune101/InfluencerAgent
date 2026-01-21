@@ -29,8 +29,7 @@ AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 # StreamlitアプリのUI構築
 ######################################
 st.title("インフルエンサー検索エージェント")
-st.write("Youtube APIを使用してインフルエンサーの情報収集します！")
-st.write("「登録者数〇万人から〇万人までの〇〇系Youtuberを検索して」といったリクエストに対応します。")
+st.write("Youtube, Instagramのインフルエンサーの情報を収集します！")
 st.write("あなたは何ができますか？ と聞いてみてください。")
 
 # チャットボックスを描画
