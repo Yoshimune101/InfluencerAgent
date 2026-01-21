@@ -11,19 +11,19 @@ AGENT_RUNTIME_ARN = os.getenv("AGENT_RUNTIME_ARN")
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 
-if "auth" not in st.secrets:
-    st.error("`.streamlit/secrets.toml` が読み込めていません（[auth] が見つからない）。配置場所とファイル名を確認してください。")
-    st.stop()
+# if "auth" not in st.secrets:
+#     st.error("`.streamlit/secrets.toml` が読み込めていません（[auth] が見つからない）。配置場所とファイル名を確認してください。")
+#     st.stop()
 
-if not getattr(st.user, "is_logged_in", False):
-    st.login("auth0") 
-    st.stop()
+# if not getattr(st.user, "is_logged_in", False):
+#     st.login("auth0") 
+#     st.stop()
 
-# メニューバー（サイドバー）に「ようこそxxさん」とログアウトボタンを表示
-with st.sidebar:
-  st.markdown(f"<h3 style='margin-bottom:0;'>ようこそ {st.user.name} さん</h3>", unsafe_allow_html=True)
-  if st.button("ログアウト", key="logout_btn_sidebar"):
-    st.logout()
+# # メニューバー（サイドバー）に「ようこそxxさん」とログアウトボタンを表示
+# with st.sidebar:
+#   st.markdown(f"<h3 style='margin-bottom:0;'>ようこそ {st.user.name} さん</h3>", unsafe_allow_html=True)
+#   if st.button("ログアウト", key="logout_btn_sidebar"):
+#     st.logout()
 
 ######################################
 # StreamlitアプリのUI構築
