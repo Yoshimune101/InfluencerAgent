@@ -19,8 +19,6 @@ if not getattr(st.user, "is_logged_in", False):
     st.login("auth0") 
     st.stop()
 
-
-
 # メニューバー（サイドバー）に「ようこそxxさん」とログアウトボタンを表示
 with st.sidebar:
   st.markdown(f"<h3 style='margin-bottom:0;'>ようこそ {st.user.name} さん</h3>", unsafe_allow_html=True)
@@ -33,7 +31,7 @@ with st.sidebar:
 st.title("インフルエンサー検索エージェント")
 st.write("Youtube APIを使用してインフルエンサーの情報収集します！")
 st.write("「登録者数〇万人から〇万人までの〇〇系Youtuberを検索して」といったリクエストに対応します。")
-st.write("例：ビールを売るために、登録者数1万人から5万人までのグルメ系Youtuberを教えて")
+st.write("あなたは何ができますか？ と聞いてみてください。")
 
 # チャットボックスを描画
 if prompt := st.chat_input("メッセージを入力してね"):
