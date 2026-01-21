@@ -3,6 +3,15 @@ import streamlit as st
 from dotenv import load_dotenv
 
 ######################################
+# ログイン
+#######################################
+if not getattr(st.user, "is_logged_in", False):
+    st.login()   # ← これだけでログイン画面
+    st.stop()
+
+st.success(f"Hello {st.user.name}")
+
+######################################
 # 環境変数と認証の設定
 ######################################
 load_dotenv()
