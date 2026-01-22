@@ -10,7 +10,6 @@ if not st.user.is_logged_in:
     st.stop()
 
 st.success(f"Hello {st.user.name}")
-st.success(f"Hello {st.user.sub}")
 
 ######################################
 # 環境変数と認証の設定
@@ -20,6 +19,24 @@ REGION = os.getenv("AWS_REGION")
 AGENT_RUNTIME_ARN = os.getenv("AGENT_RUNTIME_ARN")
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+
+######################################
+# actor_idの設定
+#######################################
+def get_actor_id_from_auth0() -> str:
+    """
+    Auth0/Streamlit の st.user から安定して一意なIDを引く。
+    優先順位: sub > id > email > name
+    """
+    u = st.user
+    return (
+        str(getattr(u, "sub", "")).strip()
+        or str(getattr(u, "id", "")).strip()
+        or str(getattr(u, "email", "")).strip()
+        or str(getattr(u, "name", "")).strip()
+        or "anonymous"
+    )
+
 
 ######################################
 # ✅ セッション（会話履歴 + AgentCoreセッションID）を保持
@@ -61,20 +78,24 @@ agentcore = get_agentcore_client(REGION)
 
 # チャットボックスを描画
 if prompt := st.chat_input("メッセージを入力してね"):
-    # ユーザーのプロンプトを表示 + 履歴に追加
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # エージェントの回答を表示
     with st.chat_message("assistant"):
-        # ✅ AgentCoreランタイムを同一セッションで呼び出す
-        payload = json.dumps({"prompt": prompt})
+        actor_id = get_actor_id_from_auth0()
+
+        payload = json.dumps({
+            "prompt": prompt,
+            "actor_id": actor_id,
+            "campaign_id": st.session_state.runtime_session_id,
+        })
+
         response = agentcore.invoke_agent_runtime(
             agentRuntimeArn=AGENT_RUNTIME_ARN,
-            runtimeSessionId=st.session_state.runtime_session_id,  # ←これが肝
+            runtimeSessionId=st.session_state.runtime_session_id,  # AgentCoreの会話継続用
             payload=payload.encode("utf-8"),
-        )  # runtimeSessionId で会話コンテキスト維持 :contentReference[oaicite:1]{index=1}
+        )
 
         ### ここから下はストリーミングレスポンスの処理 ------------------------------------------
         container = st.container()
