@@ -170,6 +170,16 @@ def set_session_id(session_id: str, actor_id: str):
     st.session_state.messages = restored
     st.rerun()
 
+def refresh_session_list(actor_id: str):
+    new_list = fetch_session_id_list(actor_id)  # AgentCoreへ問い合わせ
+    current = st.session_state.runtime_session_id
+
+    # ✅ 今のセッションがMemory側にまだ出てこない場合でも、UIから消えないように保持
+    if current and current not in new_list:
+        new_list.insert(0, current)
+
+    st.session_state.session_id_list = new_list
+
 ######################################
 # UI
 ######################################
@@ -183,25 +193,35 @@ actor_id = get_actor_id_from_auth0()
 with st.sidebar:
     st.caption("セッション管理")
 
-    if not AGENT_RUNTIME_ARN or not MEMORY_ID:
-        st.error("AGENT_RUNTIME_ARN / MEMORY_ID(AGENTCORE_MEMORY_ID) が未設定です")
-        st.stop()
+    # 初期化（ここで runtime_session_id を作るのは既に上でやっている前提）
+    if "session_id_list" not in st.session_state:
+        st.session_state.session_id_list = []
+    if "session_list_loaded" not in st.session_state:
+        st.session_state.session_list_loaded = False
+
+    def refresh_session_list(actor_id: str):
+        new_list = fetch_session_id_list(actor_id)
+        current = st.session_state.runtime_session_id
+        if current and current not in new_list:
+            new_list.insert(0, current)
+        st.session_state.session_id_list = new_list
+
+    # ✅ 初回ロードだけ自動取得
+    if not st.session_state.session_list_loaded:
+        refresh_session_list(actor_id)
+        st.session_state.session_list_loaded = True
 
     st.text_input("Current Session ID", value=st.session_state.runtime_session_id, disabled=True)
 
     if st.button("🔄 セッション一覧を更新"):
-        st.session_state.session_id_list = fetch_session_id_list(actor_id)
-
-    # 初回ロード
-    if not st.session_state.session_id_list:
-        st.session_state.session_id_list = fetch_session_id_list(actor_id)
+        refresh_session_list(actor_id)
+        st.rerun()
 
     if st.button("🆕 new thread", type="primary"):
         new_id = str(uuid.uuid4())
-        # 新規セッションとして切替（メッセージは空）
         st.session_state.runtime_session_id = new_id
         st.session_state.messages = []
-        # 一覧にも追加
+        # UI上すぐ出す（Memoryに書かれる前でも見える）
         if new_id not in st.session_state.session_id_list:
             st.session_state.session_id_list.insert(0, new_id)
         st.rerun()
@@ -211,6 +231,7 @@ with st.sidebar:
     for sid in st.session_state.session_id_list:
         st.button(
             sid,
+            key=f"sid_{sid}",  # ✅ key を付けて再描画のブレを抑える
             on_click=set_session_id,
             args=(sid, actor_id),
             use_container_width=True,
