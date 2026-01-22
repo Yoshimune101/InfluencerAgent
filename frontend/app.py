@@ -10,6 +10,7 @@ if not st.user.is_logged_in:
     st.stop()
 
 st.success(f"Hello {st.user.name}")
+st.success(f"Hello {st.user.sub}")
 
 ######################################
 # 環境変数と認証の設定
