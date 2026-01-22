@@ -88,7 +88,7 @@ if prompt := st.chat_input("メッセージを入力してね"):
         payload = json.dumps({
             "prompt": prompt,
             "actor_id": actor_id,
-            "campaign_id": st.session_state.runtime_session_id,
+            "session_id": st.session_state.runtime_session_id,
         })
 
         response = agentcore.invoke_agent_runtime(
