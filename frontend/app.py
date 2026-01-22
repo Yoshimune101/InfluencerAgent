@@ -9,7 +9,7 @@ if not st.user.is_logged_in:
     st.login("auth0")
     st.stop()
 
-st.success(f"Hello {st.user.name}")
+st.success(f"Hello {st.user.name}, {st.user.family_name}, {st.user.given_name}")
 
 ######################################
 # 環境変数と認証の設定
