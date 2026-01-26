@@ -1,4 +1,4 @@
-import os, boto3, json, uuid
+import os, boto3, json
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -17,8 +17,6 @@ st.success(f"Hello {st.user.name}")
 load_dotenv()
 REGION = os.getenv("AWS_REGION")
 AGENT_RUNTIME_ARN = os.getenv("AGENT_RUNTIME_ARN")
-AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 
 ######################################
 # actor_idの設定
@@ -37,46 +35,181 @@ def get_actor_id_from_auth0() -> str:
         or "anonymous"
     )
 
+######################################
+# AgentCore クライアント（先に作る）
+######################################
+@st.cache_resource
+def get_agentcore_client(region: str):
+    return boto3.client("bedrock-agentcore", region_name=region)
+
+agentcore = get_agentcore_client(REGION)
 
 ######################################
-# ✅ セッション（会話履歴 + AgentCoreセッションID）を保持
+# ✅ セッション状態
 ######################################
 if "messages" not in st.session_state:
-    st.session_state.messages = []  # [{"role":"user"/"assistant","content":"..."}]
+    st.session_state.messages = []
+
+if "memory_session_id" not in st.session_state:
+    st.session_state.memory_session_id = "default"
 
 if "runtime_session_id" not in st.session_state:
-    # AgentCore に同一会話として扱わせるID（このブラウザセッション中は固定）
-    st.session_state.runtime_session_id = str(uuid.uuid4())
+    # runtime は memory と揃える（ズレを無くす）
+    st.session_state.runtime_session_id = st.session_state.memory_session_id
 
 ######################################
-# StreamlitアプリのUI構築
+# AgentCore 呼び出し（control message 回収）
+######################################
+def invoke_agentcore_stream(payload_obj: dict) -> tuple[list[dict], str]:
+    """
+    AgentCore を呼び出し、ストリームから
+    - control messages（type=meta/sessions/history/error）を回収
+    - assistantの最終テキストを返す
+    """
+    response = agentcore.invoke_agent_runtime(
+        agentRuntimeArn=AGENT_RUNTIME_ARN,
+        runtimeSessionId=st.session_state.runtime_session_id,
+        payload=json.dumps(payload_obj).encode("utf-8"),
+    )
+
+    controls: list[dict] = []
+    buffer = ""
+
+    for line in response["response"].iter_lines():
+        if not line:
+            continue
+        s = line.decode("utf-8")
+        if not s.startswith("data: "):
+            continue
+
+        data = s[6:]
+        if data.startswith('"') or data.startswith("'"):
+            # 文字列コンテンツは既存仕様に合わせてスキップ
+            continue
+
+        event = json.loads(data)
+
+        # control(dict) を拾う（AgentCore側が明示的に返す type）
+        if isinstance(event, dict) and event.get("type") in ("meta", "sessions", "history", "error"):
+            controls.append(event)
+            continue
+
+        # テキスト抽出（最小）
+        if "data" in event and isinstance(event["data"], str):
+            buffer += event["data"]
+        elif "event" in event and "contentBlockDelta" in event["event"]:
+            buffer += event["event"]["contentBlockDelta"]["delta"].get("text", "")
+
+    return controls, buffer
+
+######################################
+# Streamlit UI
 ######################################
 st.title("インフルエンサー検索エージェント")
 st.write("Youtube, Instagramのインフルエンサーの情報を収集します！")
 st.write("あなたは何ができますか？ と聞いてみてください。")
 
-# ✅ リセット（必要なら）
+######################################
+# Sidebar（セッション一覧・切替）
+######################################
 with st.sidebar:
     st.caption("セッション")
-    st.code(st.session_state.runtime_session_id, language="text")
-    if st.button("会話をリセット"):
-        st.session_state.messages = []
-        st.session_state.runtime_session_id = str(uuid.uuid4())
-        st.rerun()
+    actor_id = get_actor_id_from_auth0()
 
-# ✅ 過去メッセージを先に描画（これで「前回の表示が消える」を解消）
+    # 初回は自動で一覧取得
+    if "session_list" not in st.session_state:
+        controls, _ = invoke_agentcore_stream({
+            "op": "list_sessions",
+            "actor_id": actor_id,
+        })
+        err = next((c for c in controls if c.get("type") == "error"), None)
+        if err:
+            st.error(f"list_sessions error: {err.get('message')}")
+            st.session_state.session_list = []
+        else:
+            sess = next((c for c in controls if c.get("type") == "sessions"), None)
+            st.session_state.session_list = sess.get("items", []) if sess else []
+
+    col1, col2 = st.columns(2)
+
+    # 一覧更新
+    with col1:
+        if st.button("🔄 一覧更新"):
+            controls, _ = invoke_agentcore_stream({
+                "op": "list_sessions",
+                "actor_id": actor_id,
+            })
+            err = next((c for c in controls if c.get("type") == "error"), None)
+            if err:
+                st.error(f"list_sessions error: {err.get('message')}")
+            else:
+                sess = next((c for c in controls if c.get("type") == "sessions"), None)
+                st.session_state.session_list = sess.get("items", []) if sess else []
+                st.rerun()
+
+    # 新規セッション作成
+    with col2:
+        if st.button("➕ 新規"):
+            controls, _ = invoke_agentcore_stream({
+                "op": "new_session",
+                "actor_id": actor_id,
+            })
+            err = next((c for c in controls if c.get("type") == "error"), None)
+            if err:
+                st.error(f"new_session error: {err.get('message')}")
+            else:
+                meta = next((c for c in controls if c.get("type") == "meta"), None)
+                if meta and meta.get("session_id"):
+                    st.session_state.memory_session_id = meta["session_id"]
+                    st.session_state.runtime_session_id = meta["session_id"]
+                    st.session_state.messages = []
+                    st.rerun()
+
+    options = st.session_state.session_list
+    ids = [x["session_id"] for x in options] if options else ["default"]
+    labels = [f'{x["session_id"]}  ({x.get("updatedAt","")})' for x in options] if options else ["default"]
+
+    # 現在選択中を維持
+    current_index = ids.index(st.session_state.memory_session_id) if st.session_state.memory_session_id in ids else 0
+
+    selected_index = st.selectbox(
+        "過去セッション",
+        options=list(range(len(ids))),
+        format_func=lambda i: labels[i],
+        index=current_index,
+    )
+
+    if st.button("📥 開く"):
+        target_session_id = ids[selected_index]
+        st.session_state.memory_session_id = target_session_id
+        st.session_state.runtime_session_id = target_session_id
+
+        controls, _ = invoke_agentcore_stream({
+            "op": "get_session",
+            "actor_id": actor_id,
+            "target_session_id": target_session_id,
+        })
+        err = next((c for c in controls if c.get("type") == "error"), None)
+        if err:
+            st.error(f"get_session error: {err.get('message')}")
+        else:
+            hist = next((c for c in controls if c.get("type") == "history"), None)
+            st.session_state.messages = hist.get("messages", []) if hist else []
+            st.rerun()
+
+    st.caption("現在のセッションID")
+    st.code(st.session_state.memory_session_id, language="text")
+
+######################################
+# 過去メッセージ描画
+######################################
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
-@st.cache_resource
-def get_agentcore_client(region: str):
-    # クライアント生成をキャッシュ（毎回作らない）
-    return boto3.client("bedrock-agentcore", region_name=region)
-
-agentcore = get_agentcore_client(REGION)
-
-# チャットボックスを描画
+######################################
+# Chat
+######################################
 if prompt := st.chat_input("メッセージを入力してね"):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
@@ -85,54 +218,66 @@ if prompt := st.chat_input("メッセージを入力してね"):
     with st.chat_message("assistant"):
         actor_id = get_actor_id_from_auth0()
 
-        payload = json.dumps({
+        payload_obj = {
+            "op": "chat",
             "prompt": prompt,
             "actor_id": actor_id,
-            "session_id": st.session_state.runtime_session_id,
-        })
+            "session_id": st.session_state.memory_session_id,
+        }
 
         response = agentcore.invoke_agent_runtime(
             agentRuntimeArn=AGENT_RUNTIME_ARN,
-            runtimeSessionId=st.session_state.runtime_session_id,  # AgentCoreの会話継続用
-            payload=payload.encode("utf-8"),
+            runtimeSessionId=st.session_state.runtime_session_id,
+            payload=json.dumps(payload_obj).encode("utf-8"),
         )
 
-        ### ここから下はストリーミングレスポンスの処理 ------------------------------------------
         container = st.container()
         text_holder = container.empty()
         buffer = ""
 
         for line in response["response"].iter_lines():
-            if line and line.decode("utf-8").startswith("data: "):
-                data = line.decode("utf-8")[6:]
+            if not line:
+                continue
+            s = line.decode("utf-8")
+            if not s.startswith("data: "):
+                continue
 
-                # 文字列コンテンツの場合は無視
-                if data.startswith('"') or data.startswith("'"):
-                    continue
+            data = s[6:]
+            if data.startswith('"') or data.startswith("'"):
+                continue
 
-                event = json.loads(data)
+            event = json.loads(data)
 
-                # ツール利用を検出
-                if "event" in event and "contentBlockStart" in event["event"]:
-                    if "toolUse" in event["event"]["contentBlockStart"].get("start", {}):
-                        if buffer:
-                            text_holder.markdown(buffer)
-                            buffer = ""
+            # ✅ meta / error を拾って同期（ここが重要）
+            if isinstance(event, dict) and event.get("type") == "meta":
+                sid = event.get("session_id")
+                if sid:
+                    st.session_state.memory_session_id = sid
+                    st.session_state.runtime_session_id = sid
+                continue
+            if isinstance(event, dict) and event.get("type") == "error":
+                st.error(event.get("message", "unknown error"))
+                break
 
-                        tool_name = event["event"]["contentBlockStart"]["start"]["toolUse"].get("name", "unknown")
-                        container.info(f"🔍 {tool_name} ツールを利用しています")
-                        text_holder = container.empty()
+            # ツール利用を検出（既存仕様）
+            if "event" in event and "contentBlockStart" in event["event"]:
+                if "toolUse" in event["event"]["contentBlockStart"].get("start", {}):
+                    if buffer:
+                        text_holder.markdown(buffer)
+                        buffer = ""
 
-                # テキストコンテンツを検出
-                if "data" in event and isinstance(event["data"], str):
-                    buffer += event["data"]
-                    text_holder.markdown(buffer)
-                elif "event" in event and "contentBlockDelta" in event["event"]:
-                    buffer += event["event"]["contentBlockDelta"]["delta"].get("text", "")
-                    text_holder.markdown(buffer)
+                    tool_name = event["event"]["contentBlockStart"]["start"]["toolUse"].get("name", "unknown")
+                    container.info(f"🔍 {tool_name} ツールを利用しています")
+                    text_holder = container.empty()
+
+            # テキストコンテンツを検出
+            if "data" in event and isinstance(event["data"], str):
+                buffer += event["data"]
+                text_holder.markdown(buffer)
+            elif "event" in event and "contentBlockDelta" in event["event"]:
+                buffer += event["event"]["contentBlockDelta"]["delta"].get("text", "")
+                text_holder.markdown(buffer)
 
         text_holder.markdown(buffer)
-        ### ここから上はストリーミングレスポンスの処理 ------------------------------------------
 
-    # ✅ 返答を履歴に追加（次回の rerun で残る）
     st.session_state.messages.append({"role": "assistant", "content": buffer})
