@@ -254,26 +254,20 @@ def is_tool_only_message(msg: Dict[str, Any]) -> bool:
 def render_message_content(content_list: Any) -> None:
     """
     content の中身を人間が読める形で描画する。
-    - {"text": "..."} を表示
-    - {"toolResult": {...}} は toolResult.content[].text を抽出して
-      JSONなら st.json、そうでなければ markdown
+    - {"text": "..."} は markdown（JSONでも文字として扱う）
+    - {"toolResult": {...}} の toolResult.content[].text は JSONなら st.json、だめなら markdown
     """
     if isinstance(content_list, list):
         for c in content_list:
             if not isinstance(c, dict):
                 continue
 
-            # 1) 通常テキスト
+            # 1) 通常テキスト：JSONでも “文字” として出す（全面JSON化を防ぐ）
             if isinstance(c.get("text"), str):
-                txt = c["text"]
-                parsed = try_parse_jsonish_text(txt)
-                if parsed is not None:
-                    st.json(parsed)
-                else:
-                    st.markdown(normalize_display_text(txt))
+                st.markdown(normalize_display_text(c["text"]))
                 continue
 
-            # 2) toolResult
+            # 2) toolResult：ここだけ JSON整形して読みやすくする
             tr = c.get("toolResult")
             if isinstance(tr, dict):
                 tr_contents = tr.get("content", [])
@@ -288,17 +282,14 @@ def render_message_content(content_list: Any) -> None:
                                 st.markdown(normalize_display_text(txt))
                 continue
 
-            # 3) それ以外
+            # 3) その他：最終フォールバック
             st.markdown(normalize_display_text(json.dumps(c, ensure_ascii=False)))
 
     elif isinstance(content_list, str):
-        parsed = try_parse_jsonish_text(content_list)
-        if parsed is not None:
-            st.json(parsed)
-        else:
-            st.markdown(normalize_display_text(content_list))
+        st.markdown(normalize_display_text(content_list))
     else:
         st.markdown(normalize_display_text(str(content_list)))
+
 
 
 ######################################
@@ -358,6 +349,10 @@ if "messages" not in st.session_state:
 for msg in st.session_state["messages"]:
     if not isinstance(msg, dict):
         continue
+
+    # ✅ wrapper を剥がす（message + created_at 等が混ざってもOKにする）
+    if isinstance(msg.get("message"), dict):
+        msg = msg["message"]
 
     # toolResult-only を UI に出さない（ノイズ対策）
     if is_tool_only_message(msg):
