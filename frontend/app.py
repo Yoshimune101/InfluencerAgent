@@ -1,9 +1,4 @@
-import os
-import json
-import time
-import uuid
-import re
-import hashlib
+import os, json, time, uuid, re, hashlib
 
 import boto3
 import streamlit as st
