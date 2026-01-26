@@ -166,31 +166,84 @@ def normalize_display_text(s: str) -> str:
 ######################################
 def streaming(response):
     """
-    invoke_agent_runtime のストリームを処理。
-    「テキスト delta」だけ表示する（JSONは表示しない）。
+    AgentCore invoke_agent_runtime のSSEっぽいストリームを吸収して、
+    Streamlit の st.write_stream() 用に「差分テキストだけ」を yield する。
+
+    対応する揺れ:
+    - event.contentBlockDelta.delta.text
+    - data: {"data": "..."}  (累積 or 差分のどちらでもOKにする)
+    - toolUse 開始の通知 (contentBlockStart.start.toolUse)
+    - data: "..." のような文字列JSONは無視
     """
-    for line in response["response"].iter_lines(chunk_size=10):
+    prev_cumulative = ""  # {"data": "..."} が累積で来る場合の差分抽出用
+
+    # chunk_sizeは小さいほど体感のストリーミングが良くなる（回線/負荷とトレードオフ）
+    for line in response["response"].iter_lines(chunk_size=1, decode_unicode=True):
         if not line:
             continue
 
-        s = line.decode("utf-8")
-        if not s.startswith("data: "):
+        # "data: " 行だけ拾う
+        if not line.startswith("data: "):
             continue
 
-        payload = s[6:]  # remove "data: "
+        payload = line[6:].strip()
+        if not payload:
+            continue
+
+        # data: "..." みたいな「ただのJSON文字列」は捨てる（ノイズ）
+        if (payload.startswith('"') and payload.endswith('"')) or (payload.startswith("'") and payload.endswith("'")):
+            continue
+
         try:
             obj = json.loads(payload)
         except Exception:
             continue
 
-        text = (
+        # 1) toolUse 開始を検知（表示は任意）
+        tool_name = (
+            obj.get("event", {})
+              .get("contentBlockStart", {})
+              .get("start", {})
+              .get("toolUse", {})
+              .get("name")
+        )
+        if tool_name:
+            # st.write_stream は文字列を流すだけなので、インライン通知にしておく
+            yield f"\n\n🔍 `{tool_name}` ツール実行中...\n\n"
+            continue
+
+        # 2) 新形式: contentBlockDelta の差分テキスト
+        delta = (
             obj.get("event", {})
               .get("contentBlockDelta", {})
               .get("delta", {})
               .get("text", "")
         )
-        if isinstance(text, str) and text:
-            yield text
+        if isinstance(delta, str) and delta:
+            yield delta
+            continue
+
+        # 3) 旧形式: {"data": "..."}（累積/差分のどちらでも吸収）
+        if isinstance(obj, dict) and isinstance(obj.get("data"), str):
+            s = obj["data"]
+            if not s:
+                continue
+
+            # 累積で来たときだけ差分を抜く（差分で来たならそのまま）
+            if s.startswith(prev_cumulative):
+                diff = s[len(prev_cumulative):]
+                prev_cumulative = s
+                if diff:
+                    yield diff
+            else:
+                # 差分 or 揺れ。安全側でそのまま出す
+                prev_cumulative = s
+                yield s
+            continue
+
+        # 4) その他（messagesなど終端メタ）は表示しない
+        continue
+
 
 ######################################
 # thread 切り替え（サンプル踏襲）
@@ -292,6 +345,7 @@ if prompt:
                 {
                     "memory_id": MEMORY_ID,
                     "user_id": actor_id,
+                    "text": prompt,
                     "session_id": st.session_state["session_id"],
                 },
                 ensure_ascii=False,
