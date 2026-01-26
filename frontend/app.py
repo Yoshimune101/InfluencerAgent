@@ -1,7 +1,7 @@
 import os
 import json
-import uuid
 import time
+import uuid
 import re
 import hashlib
 
@@ -10,7 +10,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 ######################################
-# ログイン
+# ログイン（Auth0）
 ######################################
 if not getattr(st.user, "is_logged_in", False):
     st.login("auth0")
@@ -19,14 +19,16 @@ if not getattr(st.user, "is_logged_in", False):
 st.success(f"Hello {st.user.name}")
 
 ######################################
-# Env / Client
+# 環境変数
 ######################################
 load_dotenv()
-
 REGION = os.getenv("AWS_REGION") or "us-west-2"
 AGENT_RUNTIME_ARN = os.getenv("AGENT_RUNTIME_ARN")
 MEMORY_ID = os.getenv("MEMORY_ID")
 
+######################################
+# AgentCore Client
+######################################
 agent_core_client = boto3.client("bedrock-agentcore", region_name=REGION)
 
 ######################################
@@ -73,39 +75,52 @@ if "session_id" not in st.session_state:
     st.session_state["session_id"] = generate_session_id()
 
 ######################################
-# messages の形式をサンプルに統一する
-# - [{"role":"user"/"assistant", "content":[{"text":"..."}]}]
+# 重要：AgentCoreの返却（wrapper）を剥がす
 ######################################
-def ensure_messages():
-    if "messages" not in st.session_state:
-        st.session_state["messages"] = []
+def unwrap_messages(obj):
+    """
+    AgentCoreから返るログの揺れを吸収して
+    messages=[{"role": "...", "content":[{"text":"..."}]}] の形に寄せる。
 
-def append_user_message(text: str):
-    ensure_messages()
-    st.session_state["messages"].append(
-        {"role": "user", "content": [{"text": text}]}
-    )
+    想定される返却:
+    - [{"message": {...}, "created_at":...}, ...]  ← あなたが見てるJSON
+    - {"messages":[...]}
+    - [{"role":"user","content":[{"text":"..."}]}, ...]
+    """
+    if isinstance(obj, list):
+        out = []
+        for x in obj:
+            if isinstance(x, dict) and isinstance(x.get("message"), dict):
+                out.append(x["message"])  # ✅ wrapper を剥がす
+            elif isinstance(x, dict) and ("role" in x and "content" in x):
+                out.append(x)
+        return out
 
-def append_assistant_message(text: str):
-    ensure_messages()
-    st.session_state["messages"].append(
-        {"role": "assistant", "content": [{"text": text}]}
-    )
+    if isinstance(obj, dict) and isinstance(obj.get("messages"), list):
+        return unwrap_messages(obj["messages"])
+
+    if isinstance(obj, dict) and isinstance(obj.get("message"), dict):
+        return [obj["message"]]
+
+    return []
 
 ######################################
-# ストリーム処理（サンプルを踏襲）
-# → contentBlockDelta.delta.text だけ拾う
+# ストリーミング（サンプル踏襲）
 ######################################
 def streaming(response):
+    """
+    invoke_agent_runtime のストリームを処理。
+    「テキスト delta」だけ表示する（JSONは表示しない）。
+    """
     for line in response["response"].iter_lines(chunk_size=10):
         if not line:
             continue
+
         s = line.decode("utf-8")
         if not s.startswith("data: "):
             continue
-        payload = s[6:]  # remove "data: "
 
-        # keep-alive等で json.loads できないものは捨てる
+        payload = s[6:]  # remove "data: "
         try:
             obj = json.loads(payload)
         except Exception:
@@ -117,7 +132,6 @@ def streaming(response):
               .get("delta", {})
               .get("text", "")
         )
-
         if isinstance(text, str) and text:
             yield text
 
@@ -143,12 +157,12 @@ if not AGENT_RUNTIME_ARN or not MEMORY_ID:
 actor_id = normalize_actor_id(get_actor_id_from_auth0())
 
 ######################################
-# 1) 初回のみ履歴ロード（サンプル踏襲）
+# 初回：messagesをロード（サンプル踏襲）
 ######################################
-ensure_messages()
+if "messages" not in st.session_state:
+    st.session_state["messages"] = []
 
-if len(st.session_state["messages"]) == 0:
-    resp = agent_core_client.invoke_agent_runtime(
+    response = agent_core_client.invoke_agent_runtime(
         agentRuntimeArn=AGENT_RUNTIME_ARN,
         runtimeSessionId=st.session_state["session_id"],
         payload=json.dumps(
@@ -163,29 +177,25 @@ if len(st.session_state["messages"]) == 0:
         qualifier="DEFAULT",
     )
 
-    # サンプル同様：返却の "data:" を json.loads した結果が
-    # 「messages配列そのもの」で返ってくる前提
-    for line in resp["response"].iter_lines(chunk_size=10):
+    # ✅ ここが核心：wrapper を剥がして messages 本体だけ保存
+    for line in response["response"].iter_lines(chunk_size=10):
         if not line:
             continue
+
         s = line.decode("utf-8")
         if not s.startswith("data: "):
             continue
+
         payload = s[6:]
         try:
             obj = json.loads(payload)
         except Exception:
             continue
 
-        # obj が list（=messages）ならそれを採用
-        # dictの場合は {"messages":[...]} も許容
-        if isinstance(obj, list):
-            st.session_state["messages"] = obj
-        elif isinstance(obj, dict) and isinstance(obj.get("messages"), list):
-            st.session_state["messages"] = obj["messages"]
+        st.session_state["messages"] = unwrap_messages(obj)
 
 ######################################
-# 2) 履歴描画（サンプル踏襲）
+# 履歴描画（サンプル踏襲）
 ######################################
 for msg in st.session_state["messages"]:
     role = str(msg.get("role", "assistant")).lower()
@@ -198,40 +208,40 @@ for msg in st.session_state["messages"]:
             for c in content_list:
                 if isinstance(c, dict) and isinstance(c.get("text"), str):
                     st.write(c["text"])
+        elif isinstance(content_list, str):
+            st.write(content_list)
 
 ######################################
-# 3) チャット入力 → invoke → ストリーミング描画（サンプル踏襲）
+# チャット入力 → invoke → ストリーミング
 ######################################
 prompt = st.chat_input()
 if prompt:
-    # UIに即表示
     with st.chat_message("user"):
         st.write(prompt)
 
-    # Memoryへも投げる（AgentCore側の仕様に合わせる）
-    resp = agent_core_client.invoke_agent_runtime(
-        agentRuntimeArn=AGENT_RUNTIME_ARN,
-        runtimeSessionId=st.session_state["session_id"],
-        payload=json.dumps(
-            {
-                "memory_id": MEMORY_ID,
-                "user_id": actor_id,
-                "session_id": st.session_state["session_id"],
-                # ✅ 英語寄り防止（必要なら外してOK）
-                "prompt": f"必ず日本語で回答してください。\n\n{prompt}",
-            },
-            ensure_ascii=False,
-        ),
-        qualifier="DEFAULT",
+    with st.spinner():
+        response = agent_core_client.invoke_agent_runtime(
+            agentRuntimeArn=AGENT_RUNTIME_ARN,
+            runtimeSessionId=st.session_state["session_id"],
+            payload=json.dumps(
+                {
+                    "memory_id": MEMORY_ID,
+                    "user_id": actor_id,
+                    "session_id": st.session_state["session_id"],
+                },
+                ensure_ascii=False,
+            ),
+            qualifier="DEFAULT",
+        )
+
+        with st.chat_message("assistant"):
+            assistant_message = st.write_stream(streaming(response))
+
+    # ✅ messagesはサンプル形式に統一して追記
+    st.session_state["messages"].append({"role": "user", "content": [{"text": prompt}]})
+    st.session_state["messages"].append(
+        {"role": "assistant", "content": [{"text": assistant_message}]}
     )
-
-    # assistant をストリーム描画
-    with st.chat_message("assistant"):
-        assistant_text = st.write_stream(streaming(resp))
-
-    # messages はサンプル形式に統一して append
-    append_user_message(prompt)
-    append_assistant_message(assistant_text)
 
     # session_id_list に自分を追加（サンプル踏襲）
     if "session_id_list" not in st.session_state:
@@ -240,7 +250,7 @@ if prompt:
         st.session_state["session_id_list"].append(st.session_state["session_id"])
 
 ######################################
-# 4) サイドバー：スレッド管理（サンプル踏襲）
+# サイドバー：スレッド管理（サンプル踏襲）
 ######################################
 with st.sidebar:
     st.text_input(label="Session ID", value=st.session_state["session_id"], disabled=True)
@@ -252,10 +262,10 @@ with st.sidebar:
         type="primary",
     )
 
-    # session_id_list を初回取得
+    # session_id_list 初回取得
     if "session_id_list" not in st.session_state:
         with st.spinner():
-            resp = agent_core_client.invoke_agent_runtime(
+            response = agent_core_client.invoke_agent_runtime(
                 agentRuntimeArn=AGENT_RUNTIME_ARN,
                 runtimeSessionId=st.session_state["session_id"],
                 payload=json.dumps(
@@ -269,12 +279,14 @@ with st.sidebar:
                 qualifier="DEFAULT",
             )
 
-            for line in resp["response"].iter_lines(chunk_size=10):
+            for line in response["response"].iter_lines(chunk_size=10):
                 if not line:
                     continue
+
                 s = line.decode("utf-8")
                 if not s.startswith("data: "):
                     continue
+
                 payload = s[6:]
                 try:
                     obj = json.loads(payload)
@@ -283,9 +295,12 @@ with st.sidebar:
 
                 # 期待: [{"sessionId":"..."}...]
                 if isinstance(obj, list):
-                    st.session_state["session_id_list"] = [x["sessionId"] for x in obj if isinstance(x, dict) and x.get("sessionId")]
+                    st.session_state["session_id_list"] = [
+                        x["sessionId"]
+                        for x in obj
+                        if isinstance(x, dict) and x.get("sessionId")
+                    ]
 
-    # session_id_list のボタン表示
     if "session_id_list" in st.session_state:
         for sid in st.session_state["session_id_list"]:
             st.button(sid, on_click=set_session_id, args=[sid])
