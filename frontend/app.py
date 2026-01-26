@@ -194,7 +194,7 @@ def _loads_maybe_double(payload: str):
             try:
                 return json.loads(s)
             except Exception:
-                return obj  # "こんちは" 等
+                return obj
         return obj
 
     return obj
@@ -203,11 +203,6 @@ def _loads_maybe_double(payload: str):
 # SSE (data: ...) パース
 ######################################
 def _iter_sse_json(response: dict, chunk_size: int = 10):
-    """
-    AgentCoreの返却ストリームが
-      data: {...}\n
-    のような SSE 形式で流れてくる想定で JSON を取り出す
-    """
     body = response.get("response")
     if body is None:
         return
@@ -220,7 +215,7 @@ def _iter_sse_json(response: dict, chunk_size: int = 10):
         if not s.startswith("data:"):
             continue
 
-        payload = s[5:].strip()  # remove "data:"
+        payload = s[5:].strip()
         if not payload:
             continue
 
@@ -231,15 +226,61 @@ def _iter_sse_json(response: dict, chunk_size: int = 10):
         yield obj
 
 ######################################
+# 履歴抽出（フレーム構造の揺れ吸収）
+######################################
+def extract_messages_from_frame(frame):
+    """
+    SSEの1フレームから messages をできるだけ取り出す。
+
+    想定:
+    - frame自体が list / {"messages":[...]} / {"message":{...}}
+    - frame["event"] の中に payload/messages が入っている
+    - payload が JSON 文字列で二重エンコードされている
+    """
+    msgs = unwrap_messages(frame)
+    if msgs:
+        return msgs
+
+    if not isinstance(frame, dict):
+        return []
+
+    event = frame.get("event")
+    if isinstance(event, dict):
+        msgs = unwrap_messages(event)
+        if msgs:
+            return msgs
+
+        payload = event.get("payload")
+        if payload is not None:
+            if isinstance(payload, (dict, list)):
+                msgs = unwrap_messages(payload)
+                if msgs:
+                    return msgs
+            elif isinstance(payload, str):
+                obj = _loads_maybe_double(payload)
+                msgs = unwrap_messages(obj) if obj is not None else []
+                if msgs:
+                    return msgs
+
+    payload = frame.get("payload")
+    if payload is not None:
+        if isinstance(payload, (dict, list)):
+            msgs = unwrap_messages(payload)
+            if msgs:
+                return msgs
+        elif isinstance(payload, str):
+            obj = _loads_maybe_double(payload)
+            msgs = unwrap_messages(obj) if obj is not None else []
+            if msgs:
+                return msgs
+
+    return []
+
+######################################
 # ストリーミング（テキスト delta のみ）
 ######################################
 def streaming(invoke_response: dict):
-    """
-    invoke_agent_runtime のストリームを処理し、テキストだけ yield。
-    dict 以外（str/list等）のフレームが混ざっても落ちないようにする。
-    """
     for obj in _iter_sse_json(invoke_response, chunk_size=10):
-        # dict じゃないフレームは捨てる（"こんちは" 等）
         if not isinstance(obj, dict):
             continue
 
@@ -247,21 +288,17 @@ def streaming(invoke_response: dict):
         if not isinstance(event, dict):
             continue
 
-        # まずは想定キー（あなたの現行実装）
         text = (
             event.get("contentBlockDelta", {})
                  .get("delta", {})
                  .get("text", "")
         )
 
-        # 万一 event の形が違う場合の保険（よくある代替パス）
+        # 代替パス（Runtime実装差分の保険）
         if not text:
-            text = (
-                event.get("delta", {})
-                     .get("text", "")
-                if isinstance(event.get("delta"), dict)
-                else ""
-            )
+            delta = event.get("delta")
+            if isinstance(delta, dict):
+                text = delta.get("text", "")
 
         if isinstance(text, str) and text:
             yield text
@@ -271,8 +308,9 @@ def streaming(invoke_response: dict):
 ######################################
 def set_session_id(session_id: str):
     st.session_state["session_id"] = session_id
-    # 表示用ログだけクリア（Memory自体は残る）
-    st.session_state["messages"] = []
+    # messages を消して「未ロード状態」に戻す
+    st.session_state.pop("messages", None)
+    st.session_state.pop("loaded_session_id", None)
 
 ######################################
 # UI
@@ -282,9 +320,9 @@ st.write("Youtube, Instagramのインフルエンサーの情報を収集しま�
 st.write("「あなたは何ができますか？」と聞いてみてください。")
 
 ######################################
-# 初回：messagesをロード（過去履歴）
+# 履歴ロード（session_id変化で必ず再取得）
 ######################################
-if "messages" not in st.session_state:
+if st.session_state.get("loaded_session_id") != st.session_state["session_id"]:
     st.session_state["messages"] = []
 
     resp = agent_core_client.invoke_agent_runtime(
@@ -303,18 +341,20 @@ if "messages" not in st.session_state:
     )
 
     latest_msgs = None
-    for obj in _iter_sse_json(resp, chunk_size=10):
-        msgs = unwrap_messages(obj)
+    for frame in _iter_sse_json(resp, chunk_size=10):
+        msgs = extract_messages_from_frame(frame)
         if msgs:
             latest_msgs = msgs
 
     if latest_msgs is not None:
         st.session_state["messages"] = latest_msgs
 
+    st.session_state["loaded_session_id"] = st.session_state["session_id"]
+
 ######################################
 # 履歴描画
 ######################################
-for msg in st.session_state["messages"]:
+for msg in st.session_state.get("messages", []):
     role = str(msg.get("role", "assistant")).lower()
     if role not in ("user", "assistant"):
         role = "assistant"
@@ -338,13 +378,12 @@ if prompt:
         st.write(prompt)
 
     with st.spinner("AgentCore実行中..."):
-        # prompt を payload に載せる（Runtime側の仕様に合わせてキー名は調整OK）
         resp = agent_core_client.invoke_agent_runtime(
             agentRuntimeArn=AGENT_RUNTIME_ARN,
             runtimeSessionId=st.session_state["session_id"],
             payload=json.dumps(
                 {
-                    "prompt": prompt,  # ←重要
+                    "prompt": prompt,  # ←重要（Runtime側に合わせて変更可）
                     "memory_id": MEMORY_ID,
                     "user_id": actor_id,
                     "session_id": st.session_state["session_id"],
@@ -358,14 +397,14 @@ if prompt:
             assistant_message = st.write_stream(streaming(resp))
 
     # 表示ログに追記
+    st.session_state.setdefault("messages", [])
     st.session_state["messages"].append({"role": "user", "content": [{"text": prompt}]})
     st.session_state["messages"].append(
         {"role": "assistant", "content": [{"text": assistant_message or ""}]}
     )
 
     # session_id_list に自分を追加
-    if "session_id_list" not in st.session_state:
-        st.session_state["session_id_list"] = []
+    st.session_state.setdefault("session_id_list", [])
     if st.session_state["session_id"] not in st.session_state["session_id_list"]:
         st.session_state["session_id_list"].append(st.session_state["session_id"])
 
@@ -409,6 +448,5 @@ with st.sidebar:
                         if isinstance(x, dict) and x.get("sessionId")
                     ]
 
-    # セッションボタン
     for sid in st.session_state.get("session_id_list", []):
         st.button(sid, on_click=set_session_id, args=[sid])
