@@ -85,6 +85,11 @@ if "session_id" not in st.session_state:
 def unwrap_messages(obj):
     """
     messages=[{"role": "...", "content":[{"text":"..."}]}] に寄せる
+
+    想定:
+    - [{"message": {...}, ...}, ...]
+    - {"messages":[...]}
+    - [{"role":"user","content":[{"text":"..."}]}, ...]
     """
     if isinstance(obj, list):
         out = []
@@ -116,6 +121,11 @@ def _extract_text_from_message_obj(m: dict) -> str:
     return ""
 
 def normalize_display_text(s: str) -> str:
+    """
+    画面表示用の最終正規化。
+    - s が JSON 文字列なら json.loads して wrapper を剥がし、本文だけ抜く
+    - \\uXXXX は json.loads できれば自動復元される
+    """
     if not isinstance(s, str):
         return str(s)
 
@@ -153,7 +163,6 @@ def _iter_lines_any(body, chunk_size: int = 10):
     - botocore.response.StreamingBody.iter_lines(...) でも
     どちらでも読めるようにする互換層
     """
-    # requests は decode_unicode を受けるが botocore は受けない
     try:
         it = body.iter_lines(chunk_size=chunk_size, decode_unicode=False)
     except TypeError:
@@ -167,6 +176,28 @@ def _iter_lines_any(body, chunk_size: int = 10):
         else:
             s = str(line)
         yield s
+
+def _loads_maybe_double(payload: str):
+    """
+    data: の payload を json.loads して、
+    結果がさらに JSON 文字列だったらもう一回だけ json.loads する。
+    dict/list 以外（ただの文字列等）はそのまま返す。
+    """
+    try:
+        obj = json.loads(payload)
+    except Exception:
+        return None
+
+    if isinstance(obj, str):
+        s = obj.strip()
+        if s.startswith("{") or s.startswith("["):
+            try:
+                return json.loads(s)
+            except Exception:
+                return obj  # "こんちは" 等
+        return obj
+
+    return obj
 
 ######################################
 # SSE (data: ...) パース
@@ -185,6 +216,7 @@ def _iter_sse_json(response: dict, chunk_size: int = 10):
         if not s:
             continue
         s = s.strip()
+
         if not s.startswith("data:"):
             continue
 
@@ -192,27 +224,45 @@ def _iter_sse_json(response: dict, chunk_size: int = 10):
         if not payload:
             continue
 
-        try:
-            obj = json.loads(payload)
-            yield obj
-        except Exception:
-            # 途中フレーム/ゴミは捨てる
+        obj = _loads_maybe_double(payload)
+        if obj is None:
             continue
+
+        yield obj
 
 ######################################
 # ストリーミング（テキスト delta のみ）
 ######################################
 def streaming(invoke_response: dict):
     """
-    invoke_agent_runtime のストリームを処理し、テキストだけ yield
+    invoke_agent_runtime のストリームを処理し、テキストだけ yield。
+    dict 以外（str/list等）のフレームが混ざっても落ちないようにする。
     """
     for obj in _iter_sse_json(invoke_response, chunk_size=10):
+        # dict じゃないフレームは捨てる（"こんちは" 等）
+        if not isinstance(obj, dict):
+            continue
+
+        event = obj.get("event") or {}
+        if not isinstance(event, dict):
+            continue
+
+        # まずは想定キー（あなたの現行実装）
         text = (
-            obj.get("event", {})
-              .get("contentBlockDelta", {})
-              .get("delta", {})
-              .get("text", "")
+            event.get("contentBlockDelta", {})
+                 .get("delta", {})
+                 .get("text", "")
         )
+
+        # 万一 event の形が違う場合の保険（よくある代替パス）
+        if not text:
+            text = (
+                event.get("delta", {})
+                     .get("text", "")
+                if isinstance(event.get("delta"), dict)
+                else ""
+            )
+
         if isinstance(text, str) and text:
             yield text
 
@@ -221,7 +271,7 @@ def streaming(invoke_response: dict):
 ######################################
 def set_session_id(session_id: str):
     st.session_state["session_id"] = session_id
-    # 表示用ログをクリア（必要なら保持戦略に変えてOK）
+    # 表示用ログだけクリア（Memory自体は残る）
     st.session_state["messages"] = []
 
 ######################################
@@ -288,13 +338,13 @@ if prompt:
         st.write(prompt)
 
     with st.spinner("AgentCore実行中..."):
-        # ここで prompt を payload に載せる（あなた側のRuntime実装に合わせてキー名調整可）
+        # prompt を payload に載せる（Runtime側の仕様に合わせてキー名は調整OK）
         resp = agent_core_client.invoke_agent_runtime(
             agentRuntimeArn=AGENT_RUNTIME_ARN,
             runtimeSessionId=st.session_state["session_id"],
             payload=json.dumps(
                 {
-                    "prompt": prompt,          # ← 重要：ユーザ入力
+                    "prompt": prompt,  # ←重要
                     "memory_id": MEMORY_ID,
                     "user_id": actor_id,
                     "session_id": st.session_state["session_id"],
@@ -307,7 +357,7 @@ if prompt:
         with st.chat_message("assistant"):
             assistant_message = st.write_stream(streaming(resp))
 
-    # 表示ログに追記（role/content 形式を維持）
+    # 表示ログに追記
     st.session_state["messages"].append({"role": "user", "content": [{"text": prompt}]})
     st.session_state["messages"].append(
         {"role": "assistant", "content": [{"text": assistant_message or ""}]}
