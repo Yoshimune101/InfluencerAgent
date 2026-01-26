@@ -51,14 +51,11 @@ ACTOR_ID_ALLOWED = re.compile(
 THREAD_ID_ALLOWED = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9\-_]*$")
 
 def normalize_actor_id(raw: str) -> str:
-    """
-    'actor:' が既に付いている場合は二重付与しない
-    """
     if not raw:
         raw = "anonymous"
     raw = str(raw).strip()
     if raw.startswith("actor:"):
-        raw = raw[len("actor:"):]
+        raw = raw[len("actor:") :]
 
     safe = re.sub(r"[^a-zA-Z0-9\-_\/:]", "_", raw)
     if not re.match(r"^[a-zA-Z0-9]", safe):
@@ -73,15 +70,11 @@ def normalize_actor_id(raw: str) -> str:
     return f"actor:{digest}"
 
 def normalize_thread_id(raw: str) -> str:
-    """
-    thread_id(session_id) は ':' '/' を入れない。
-    'sess_' が既に付いている場合は二重付与しない
-    """
     if not raw:
         raw = "default"
     raw = str(raw).strip()
     if raw.startswith("sess_"):
-        raw = raw[len("sess_"):]
+        raw = raw[len("sess_") :]
 
     safe = re.sub(r"[^a-zA-Z0-9\-_]", "_", raw)
     if not re.match(r"^[a-zA-Z0-9]", safe):
@@ -98,8 +91,7 @@ def normalize_thread_id(raw: str) -> str:
 # セッション状態
 ######################################
 if "messages" not in st.session_state:
-    # UI表示用: [{"role":"user"/"assistant","content":"..."}]
-    st.session_state.messages = []
+    st.session_state.messages = []  # list of raw items
 
 if "runtime_session_id" not in st.session_state:
     st.session_state.runtime_session_id = str(uuid.uuid4())
@@ -125,16 +117,70 @@ def switch_thread(thread_id: str):
     st.rerun()
 
 ######################################
-# 正規化（表示用）
+# SSE data パース（ここが根治）
+######################################
+def parse_sse_data(data: str):
+    """
+    AgentCoreのSSE `data: ...` は
+    - JSON object/array
+    - JSON string（中身がさらにJSON）
+    - keep-alive的な文字列
+    が混ざる。
+
+    ここで “二段階” まで json.loads を試し、dict/list に寄せる。
+    """
+    if data is None:
+        return None
+
+    s = data.strip()
+    if not s:
+        return None
+
+    # まず1段階
+    try:
+        obj = json.loads(s)
+    except Exception:
+        # JSONでないなら、そのまま文字列扱い
+        return s
+
+    # 2段階目：objが「JSON文字列」なら中身も解釈する
+    if isinstance(obj, str):
+        inner = obj.strip()
+        if inner.startswith("{") or inner.startswith("["):
+            try:
+                return json.loads(inner)
+            except Exception:
+                return obj
+        return obj
+
+    return obj
+
+######################################
+# メッセージ正規化（string JSON も dict も吸収）
 ######################################
 def normalize_message_item(item):
     """
-    AgentCore側の返却揺れを吸収し、必ず {role, content(str)} を返す。
-    対応:
-    - {"role":"assistant","content":[{"text":"..."}]}
-    - {"message":{"role":"assistant","content":[{"text":"..."}]}, ...}
-    - {"message":{"role":"user","content":[{"toolResult": {...}}]}, ...}
+    返り値: {"role": "user"/"assistant", "content": "<string>"}
     """
+    # ✅ ここが重要：JSONっぽい“文字列”なら dict/list に変換してから処理
+    if isinstance(item, str):
+        maybe = item.strip()
+        if maybe.startswith("{") or maybe.startswith("["):
+            try:
+                item = json.loads(maybe)
+            except Exception:
+                return {"role": "assistant", "content": item}
+        else:
+            return {"role": "assistant", "content": item}
+
+    if isinstance(item, list):
+        parts = []
+        for it in item:
+            m = normalize_message_item(it)
+            if m["content"]:
+                parts.append(m["content"])
+        return {"role": "assistant", "content": "\n".join(parts).strip()}
+
     if not isinstance(item, dict):
         return {"role": "assistant", "content": str(item)}
 
@@ -146,20 +192,16 @@ def normalize_message_item(item):
 
     content = core.get("content")
 
-    # list: [{"text":...}] / [{"toolResult":...}]
     if isinstance(content, list):
         parts = []
         for c in content:
             if not isinstance(c, dict):
                 continue
 
-            # text
-            t = c.get("text")
-            if isinstance(t, str) and t:
-                parts.append(t)
+            if isinstance(c.get("text"), str) and c["text"]:
+                parts.append(c["text"])
                 continue
 
-            # toolResult
             tr = c.get("toolResult")
             if isinstance(tr, dict):
                 tr_contents = tr.get("content")
@@ -178,37 +220,11 @@ def normalize_message_item(item):
 
         return {"role": role, "content": "".join(parts).strip()}
 
-    # string content
     if isinstance(content, str):
         return {"role": role, "content": content}
 
+    # dict等は表示しない（JSON露出防止）
     return {"role": role, "content": ""}
-
-def extract_text_from_data_string(s: str) -> str:
-    """
-    ストリーム event["data"] に JSON文字列が混ざるケースの保険。
-    JSONなら parse して text だけ抜く。JSONでないなら捨てる。
-    """
-    if not s:
-        return ""
-    ss = s.strip()
-    if ss.startswith("{") or ss.startswith("["):
-        try:
-            obj = json.loads(ss)
-            if isinstance(obj, dict):
-                m = normalize_message_item(obj)
-                return m["content"]
-            if isinstance(obj, list):
-                parts = []
-                for it in obj:
-                    m = normalize_message_item(it)
-                    if m["content"]:
-                        parts.append(m["content"])
-                return "\n".join(parts).strip()
-            return ""
-        except Exception:
-            return ""
-    return ""
 
 ######################################
 # UI
@@ -255,33 +271,24 @@ if st.session_state.loaded_thread_id != st.session_state.thread_id:
         for line in resp["response"].iter_lines():
             if not line:
                 continue
-
             s = line.decode("utf-8")
             if not s.startswith("data: "):
                 continue
 
-            data = s[6:]
-            if data.startswith('"') or data.startswith("'"):
+            raw = s[6:]
+            obj = parse_sse_data(raw)
+
+            # keep-alive等（意味ない短文）は捨てる
+            if obj is None:
+                continue
+            if isinstance(obj, str) and len(obj.strip()) <= 2:
                 continue
 
-            obj = json.loads(data)
-
-            if isinstance(obj, list):
-                for item in obj:
-                    m = normalize_message_item(item)
-                    if m["content"]:
-                        loaded.append(m)
-            elif isinstance(obj, dict):
-                # {"messages":[...]} 形式も吸収
-                if isinstance(obj.get("messages"), list):
-                    for item in obj["messages"]:
-                        m = normalize_message_item(item)
-                        if m["content"]:
-                            loaded.append(m)
-                else:
-                    m = normalize_message_item(obj)
-                    if m["content"]:
-                        loaded.append(m)
+            # list/dict/string すべて normalize して積む
+            m = normalize_message_item(obj)
+            if m["content"]:
+                # ここで “常に” UI用の形に統一する
+                loaded.append({"role": m["role"], "content": m["content"]})
 
         st.session_state.messages = loaded
         st.session_state.loaded_thread_id = st.session_state.thread_id
@@ -292,7 +299,7 @@ if st.session_state.loaded_thread_id != st.session_state.thread_id:
         st.session_state.loaded_thread_id = st.session_state.thread_id
 
 ######################################
-# 2) 表示（必ず正規化してから描画）
+# 2) 表示（必ず normalize → 描画）
 ######################################
 for raw in st.session_state.messages:
     m = normalize_message_item(raw)
@@ -302,18 +309,19 @@ for raw in st.session_state.messages:
         st.markdown(m["content"])
 
 ######################################
-# 3) チャット入力 → ストリーミング（JSON混入根治）
+# 3) チャット入力 → ストリーミング
 ######################################
 prompt = st.chat_input("メッセージを入力してね")
 if prompt:
-    # 表示用に先に積む
+    # UI用に積む（必ずUI標準形）
     st.session_state.messages.append({"role": "user", "content": prompt})
+
     with st.chat_message("user"):
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        # 日本語固定（英語寄りの抑止）
         req_payload = {
+            # ✅ 英語寄りを抑止
             "prompt": f"必ず日本語で回答してください。\n\n{prompt}",
             "actor_id": actor_id,
             "session_id": st.session_state.thread_id,
@@ -328,51 +336,49 @@ if prompt:
         for line in resp["response"].iter_lines():
             if not line:
                 continue
-
             s = line.decode("utf-8")
             if not s.startswith("data: "):
                 continue
 
-            data = s[6:]
-            if data.startswith('"') or data.startswith("'"):
+            raw = s[6:]
+            event = parse_sse_data(raw)
+            if event is None:
                 continue
 
-            event = json.loads(data)
+            # eventが dict 以外なら捨てる（ここが “JSON丸出し” 根絶）
+            if not isinstance(event, dict):
+                continue
 
             # toolUse開始
-            if "event" in event and "contentBlockStart" in event["event"]:
-                start = event["event"]["contentBlockStart"].get("start", {})
-                tool = start.get("toolUse")
-                if tool:
-                    if buffer:
+            if "event" in event and isinstance(event["event"], dict):
+                ev = event["event"]
+
+                if "contentBlockStart" in ev:
+                    start = ev["contentBlockStart"].get("start", {})
+                    tool = start.get("toolUse")
+                    if tool:
+                        if buffer:
+                            text_holder.markdown(buffer)
+                            buffer = ""
+                        tool_name = tool.get("name", "unknown")
+                        container.info(f"🔍 {tool_name} ツールを利用しています")
+                        text_holder = container.empty()
+                    continue
+
+                # ✅ テキストdeltaのみ採用
+                if "contentBlockDelta" in ev:
+                    delta = ev["contentBlockDelta"].get("delta", {})
+                    t = delta.get("text")
+                    if isinstance(t, str) and t:
+                        buffer += t
                         text_holder.markdown(buffer)
-                        buffer = ""
-                    tool_name = tool.get("name", "unknown")
-                    container.info(f"🔍 {tool_name} ツールを利用しています")
-                    text_holder = container.empty()
-                continue
+                    continue
 
-            # ✅ ここだけ採用（assistantのテキストdelta）
-            if "event" in event and "contentBlockDelta" in event["event"]:
-                delta = event["event"]["contentBlockDelta"].get("delta", {})
-                t = delta.get("text")
-                if isinstance(t, str) and t:
-                    buffer += t
-                    text_holder.markdown(buffer)
-                continue
-
-            # event["data"] は原則捨てる（JSON混入の根源）
-            # ただしJSON文字列ならテキストだけ抽出して採用（保険）
-            if "data" in event and isinstance(event["data"], str):
-                extracted = extract_text_from_data_string(event["data"])
-                if extracted:
-                    buffer += extracted
-                    text_holder.markdown(buffer)
-                continue
+            # event["data"] は採用しない（混入源）
+            # ここに落ちるものは全部無視
 
         text_holder.markdown(buffer)
 
-    # 表示用履歴に積む
     st.session_state.messages.append({"role": "assistant", "content": buffer})
 
 ######################################
@@ -405,16 +411,11 @@ with st.sidebar:
             for line in resp["response"].iter_lines():
                 if not line:
                     continue
-
                 s = line.decode("utf-8")
                 if not s.startswith("data: "):
                     continue
 
-                data = s[6:]
-                if data.startswith('"') or data.startswith("'"):
-                    continue
-
-                obj = json.loads(data)
+                obj = parse_sse_data(s[6:])
                 if isinstance(obj, list):
                     for x in obj:
                         if isinstance(x, dict) and x.get("sessionId"):
