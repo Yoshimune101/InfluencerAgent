@@ -125,7 +125,7 @@ def normalize_display_text(s: str) -> str:
     画面表示用の最終正規化。
 
     - s が JSON 文字列なら json.loads して wrapper を剥がし、本文だけ抜く
-    - \\uXXXX は json.loads できれば自動で復元される
+    - \uXXXX は json.loads できれば自動で復元される
     - それでも無理なら生文字列で返す
     """
     if not isinstance(s, str):
@@ -166,87 +166,31 @@ def normalize_display_text(s: str) -> str:
 ######################################
 def streaming(response):
     """
-    AgentCore invoke_agent_runtime のストリームを Streamlit の st.write_stream 用に変換して流す。
-    botocore StreamingBody は iter_lines(decode_unicode=...) を受け付けない場合があるので、
-    常に bytes -> str を自前で decode する。
+    invoke_agent_runtime のストリームを処理。
+    「テキスト delta」だけ表示する（JSONは表示しない）。
     """
-    prev_cumulative = ""  # {"data": "..."} が累積で来る場合の差分抽出用
-
-    body = response.get("response")
-    if body is None:
-        return
-
-    # iter_lines は bytes を返す前提で扱う（str が来ても吸収）
-    for line in body.iter_lines(chunk_size=1):
+    for line in response["response"].iter_lines(chunk_size=10):
         if not line:
             continue
 
-        # bytes / str を吸収
-        if isinstance(line, (bytes, bytearray)):
-            s = line.decode("utf-8", errors="ignore")
-        else:
-            s = str(line)
-
+        s = line.decode("utf-8")
         if not s.startswith("data: "):
             continue
 
-        payload = s[6:].strip()
-        if not payload:
-            continue
-
-        # data: "..." みたいな文字列JSONは捨てる（ノイズ対策）
-        if (payload.startswith('"') and payload.endswith('"')) or (payload.startswith("'") and payload.endswith("'")):
-            continue
-
+        payload = s[6:]  # remove "data: "
         try:
             obj = json.loads(payload)
         except Exception:
             continue
 
-        # 1) toolUse 開始通知（任意）
-        tool_name = (
-            obj.get("event", {})
-              .get("contentBlockStart", {})
-              .get("start", {})
-              .get("toolUse", {})
-              .get("name")
-        )
-        if tool_name:
-            yield f"\n\n🔍 `{tool_name}` ツール実行中...\n\n"
-            continue
-
-        # 2) 新形式: contentBlockDelta の差分
-        delta = (
+        text = (
             obj.get("event", {})
               .get("contentBlockDelta", {})
               .get("delta", {})
               .get("text", "")
         )
-        if isinstance(delta, str) and delta:
-            yield delta
-            continue
-
-        # 3) 旧形式: {"data": "..."}（累積/差分どちらも吸収）
-        if isinstance(obj, dict) and isinstance(obj.get("data"), str):
-            s2 = obj["data"]
-            if not s2:
-                continue
-
-            # 累積なら差分を抜く
-            if s2.startswith(prev_cumulative):
-                diff = s2[len(prev_cumulative):]
-                prev_cumulative = s2
-                if diff:
-                    yield diff
-            else:
-                # 差分/揺れはそのまま
-                prev_cumulative = s2
-                yield s2
-            continue
-
-        # その他メタは無視
-        continue
-
+        if isinstance(text, str) and text:
+            yield text
 
 ######################################
 # thread 切り替え（サンプル踏襲）
@@ -346,8 +290,6 @@ if prompt:
             runtimeSessionId=st.session_state["session_id"],
             payload=json.dumps(
                 {
-                    "action": "chat",
-                    "text": prompt,  # ★これが無いと返答が空になりがち
                     "memory_id": MEMORY_ID,
                     "user_id": actor_id,
                     "session_id": st.session_state["session_id"],
