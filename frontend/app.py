@@ -125,7 +125,7 @@ def normalize_display_text(s: str) -> str:
     画面表示用の最終正規化。
 
     - s が JSON 文字列なら json.loads して wrapper を剥がし、本文だけ抜く
-    - \uXXXX は json.loads できれば自動で復元される
+    - \\uXXXX は json.loads できれば自動で復元される
     - それでも無理なら生文字列で返す
     """
     if not isinstance(s, str):
