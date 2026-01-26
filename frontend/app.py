@@ -64,7 +64,6 @@ def normalize_session_id(raw: str) -> str:
         raw = "default"
 
     s = str(raw).strip()
-
     while s.startswith("sess_"):
         s = s[len("sess_") :]
 
@@ -142,77 +141,74 @@ if "runtime_session_id" not in st.session_state:
 else:
     st.session_state.runtime_session_id = ensure_runtime_session_id(st.session_state.runtime_session_id)
 
-######################################
-# ✅ Memory：ListEvents を集計して “セッション一覧” を作る（堅い）
-######################################
-def list_memory_sessions_via_events(memory_id: str, actor_id: str, max_results: int = 100) -> list[dict]:
-    """
-    list_sessions が空になる/仕様差分がある環境でも確実に一覧化できるよう、
-    actorId 単位で list_events をページング取得し、sessionId で集計して疑似一覧を作る。
-    """
-    events: list[dict] = []
-    next_token = None
-    last_err = None
+# ✅ 過去に見た sessionId 候補を保持（actorごと）
+if "known_session_ids" not in st.session_state:
+    st.session_state.known_session_ids = {}  # { actor_id: set([...]) }
 
-    # list_events はページングがあるので回す
-    # 上限を設けて暴走防止（必要なら増やしてOK）
-    HARD_CAP_EVENTS = 3000
+actor_id = st.session_state.actor_id
+st.session_state.known_session_ids.setdefault(actor_id, set())
+st.session_state.known_session_ids[actor_id].add(st.session_state.memory_session_id)
+
+######################################
+# Memory：ListSessions（本命）
+######################################
+def list_memory_sessions_official(memory_id: str, actor_id: str, max_results: int = 100) -> list[dict]:
+    """
+    公式 list_sessions を叩き、返却形式の揺れを吸収して
+    [{"sessionId": "...", "createdAt": "...", "updatedAt": "..."}] に正規化して返す。
+    """
+    items: list[dict] = []
+    next_token = None
 
     while True:
-        kwargs = {
-            "memoryId": memory_id,
-            "actorId": actor_id,
-            "includePayloads": False,
-            "maxResults": 100,
-        }
+        kwargs = {"memoryId": memory_id, "actorId": actor_id, "maxResults": min(max_results, 100)}
         if next_token:
             kwargs["nextToken"] = next_token
 
         try:
-            res = agentcore.list_events(**kwargs)
+            res = agentcore.list_sessions(**kwargs)
         except Exception as e:
-            last_err = e
             msg = str(e)
-            # actor未作成時（eventsが1件もない）は ResourceNotFoundException で落ちることがある → 空扱い
+            # actor未作成時は not found → 空扱い
             if "ResourceNotFoundException" in msg and "not found" in msg:
                 return []
             raise
 
-        events.extend(res.get("events", []))
-        if len(events) >= HARD_CAP_EVENTS:
-            break
+        # 揺れ吸収：sessionSummaries / items / sessions
+        raw_list = (
+            res.get("sessionSummaries")
+            or res.get("items")
+            or res.get("sessions")
+            or []
+        )
+
+        for s in raw_list:
+            sid = s.get("sessionId") or s.get("session_id")
+            if not sid:
+                continue
+            sid = normalize_session_id(sid)
+
+            created_at = s.get("createdAt") or s.get("created_at") or ""
+            updated_at = s.get("updatedAt") or s.get("updated_at") or created_at or ""
+
+            items.append(
+                {
+                    "sessionId": sid,
+                    "createdAt": str(created_at) if created_at else "",
+                    "updatedAt": str(updated_at) if updated_at else "",
+                }
+            )
 
         next_token = res.get("nextToken")
-        if not next_token:
+        if not next_token or len(items) >= max_results:
             break
 
-    # sessionId ごとに最新 timestamp を残す
-    by_session: dict[str, dict] = {}
-    for ev in events:
-        sid = ev.get("sessionId") or ev.get("session_id")
-        ts = ev.get("eventTimestamp") or ev.get("timestamp")
-
-        if not sid:
-            continue
-
-        # sessionId は念のため normalize（増殖しない）
-        sid = normalize_session_id(sid)
-
-        # ts を文字列化して比較（datetime/str混在を安全に処理）
-        ts_str = str(ts) if ts is not None else ""
-
-        cur = by_session.get(sid)
-        if cur is None or (ts_str and cur.get("updatedAt", "") < ts_str):
-            by_session[sid] = {
-                "sessionId": sid,
-                "updatedAt": ts_str,
-            }
-
-    sessions = sorted(by_session.values(), key=lambda x: x.get("updatedAt", ""), reverse=True)
-    return sessions[:max_results]
+    # updated desc
+    items.sort(key=lambda x: x.get("updatedAt", ""), reverse=True)
+    return items[:max_results]
 
 ######################################
-# Memory：履歴（ListEvents sessionId指定）
+# Memory：ListEvents（sessionId必須の環境用）
 ######################################
 def load_memory_history(memory_id: str, actor_id: str, session_id: str, max_events: int = 300) -> list[dict]:
     session_id = normalize_session_id(session_id)
@@ -263,19 +259,24 @@ def load_memory_history(memory_id: str, actor_id: str, session_id: str, max_even
     return messages
 
 ######################################
-# ✅ Memory疎通：この sessionId に events があるか確認
+# ✅ セッション一覧取得（official優先、fallbackで既知ID）
 ######################################
-def probe_memory_events(memory_id: str, actor_id: str, session_id: str) -> tuple[int, dict | None]:
-    session_id = normalize_session_id(session_id)
-    res = agentcore.list_events(
-        memoryId=memory_id,
-        actorId=actor_id,
-        sessionId=session_id,
-        includePayloads=False,
-        maxResults=10,
-    )
-    evs = res.get("events", []) or []
-    return len(evs), (evs[0] if evs else None)
+def get_session_list(memory_id: str, actor_id: str) -> list[dict]:
+    """
+    official list_sessions が空でも UI を動かす。
+    - official が取れればそれを返す
+    - 空なら known_session_ids（ローカル候補）を並べる
+    """
+    official = list_memory_sessions_official(memory_id, actor_id, max_results=100)
+    if official:
+        # officialで取れたものを known にも反映
+        for s in official:
+            st.session_state.known_session_ids[actor_id].add(s["sessionId"])
+        return official
+
+    # fallback：ローカルに知ってるIDだけ表示
+    known = sorted(list(st.session_state.known_session_ids.get(actor_id, set())))
+    return [{"sessionId": sid, "createdAt": "", "updatedAt": ""} for sid in known]
 
 ######################################
 # UI
@@ -289,6 +290,7 @@ st.write("あなたは何ができますか？ と聞いてみてください。
 ######################################
 with st.sidebar:
     st.caption("セッション（AgentCore Memory）")
+
     actor_id = st.session_state.actor_id
     if not ACTOR_ID_ALLOWED.match(actor_id):
         st.error(f"actor_id invalid: {actor_id}")
@@ -299,57 +301,37 @@ with st.sidebar:
     st.write("memory_session_id:", repr(st.session_state.memory_session_id))
     st.write("runtime_session_id:", repr(st.session_state.runtime_session_id))
 
-    # ✅ 疎通チェック（今の sessionId にイベントがあるか）
-    if st.button("🧪 Memory疎通（このsessionのevents）"):
-        try:
-            cnt, e0 = probe_memory_events(MEMORY_ID, actor_id, st.session_state.memory_session_id)
-            st.write("events count:", cnt)
-            if e0:
-                st.json(
-                    {
-                        "name": e0.get("name"),
-                        "sessionId": e0.get("sessionId"),
-                        "eventTimestamp": str(e0.get("eventTimestamp")),
-                        "hasPayload": bool(e0.get("payload")),
-                    }
-                )
-        except Exception as e:
-            st.error(f"probe failed: {e}")
-
-    # 初回ロード：list_events集計で一覧作成
     if "session_list" not in st.session_state:
         try:
-            st.session_state.session_list = list_memory_sessions_via_events(MEMORY_ID, actor_id)
+            st.session_state.session_list = get_session_list(MEMORY_ID, actor_id)
         except Exception as e:
-            st.error(f"list sessions (via events) failed: {e}")
-            st.session_state.session_list = []
+            st.error(f"list sessions failed: {e}")
+            st.session_state.session_list = [{"sessionId": st.session_state.memory_session_id, "createdAt": "", "updatedAt": ""}]
 
     col1, col2 = st.columns(2)
 
     with col1:
         if st.button("🔄 一覧更新"):
             try:
-                st.session_state.session_list = list_memory_sessions_via_events(MEMORY_ID, actor_id)
+                st.session_state.session_list = get_session_list(MEMORY_ID, actor_id)
                 st.rerun()
             except Exception as e:
-                st.error(f"list sessions (via events) failed: {e}")
+                st.error(f"list sessions failed: {e}")
 
     with col2:
         if st.button("➕ 新規"):
             new_sid = generate_new_session_id(actor_id)
             st.session_state.memory_session_id = new_sid
+            st.session_state.known_session_ids[actor_id].add(new_sid)
             st.session_state.messages = []
             st.rerun()
 
     sessions = st.session_state.session_list or []
-
-    # まだ events が無い場合も UI が動くように fallback
-    if not sessions:
-        ids = [st.session_state.memory_session_id]
-        labels = [st.session_state.memory_session_id]
-    else:
-        ids = [s["sessionId"] for s in sessions]
-        labels = [f'{s["sessionId"]}  ({s.get("updatedAt","")})' for s in sessions]
+    ids = [s["sessionId"] for s in sessions] if sessions else [st.session_state.memory_session_id]
+    labels = [
+        f'{s["sessionId"]}  ({s.get("updatedAt") or s.get("createdAt") or ""})'
+        for s in sessions
+    ] if sessions else [st.session_state.memory_session_id]
 
     current_sid = st.session_state.memory_session_id if st.session_state.memory_session_id in ids else ids[0]
     current_index = ids.index(current_sid)
@@ -364,6 +346,7 @@ with st.sidebar:
     if st.button("📥 開く"):
         target_session_id = normalize_session_id(ids[selected_index])
         st.session_state.memory_session_id = target_session_id
+        st.session_state.known_session_ids[actor_id].add(target_session_id)
         try:
             st.session_state.messages = load_memory_history(MEMORY_ID, actor_id, target_session_id)
             st.rerun()
@@ -423,7 +406,9 @@ if prompt := st.chat_input("メッセージを入力してね"):
             if isinstance(event, dict) and event.get("type") == "meta":
                 sid = event.get("session_id")
                 if sid:
-                    st.session_state.memory_session_id = normalize_session_id(sid)
+                    sid = normalize_session_id(sid)
+                    st.session_state.memory_session_id = sid
+                    st.session_state.known_session_ids[st.session_state.actor_id].add(sid)
                 continue
 
             if isinstance(event, dict) and event.get("type") == "error":
@@ -441,8 +426,8 @@ if prompt := st.chat_input("メッセージを入力してね"):
 
     st.session_state.messages.append({"role": "assistant", "content": buffer})
 
-    # ✅ チャット後に一覧を自動更新（新しいsessionが増えたらすぐ反映）
+    # チャット後に一覧を更新（取れない環境でも known に入ってるのでUIは増える）
     try:
-        st.session_state.session_list = list_memory_sessions_via_events(MEMORY_ID, st.session_state.actor_id)
+        st.session_state.session_list = get_session_list(MEMORY_ID, st.session_state.actor_id)
     except Exception:
         pass
