@@ -1,4 +1,10 @@
-import os, boto3, json, uuid, re, hashlib
+import os
+import boto3
+import json
+import uuid
+import re
+import hashlib
+
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -12,16 +18,13 @@ if not getattr(st.user, "is_logged_in", False):
 st.success(f"Hello {st.user.name}")
 
 ######################################
-# 環境変数と認証の設定
+# 環境変数とクライアント
 ######################################
 load_dotenv()
 
 REGION = os.getenv("AWS_REGION") or "us-west-2"
 AGENT_RUNTIME_ARN = os.getenv("AGENT_RUNTIME_ARN")
 MEMORY_ID = os.getenv("MEMORY_ID")
-
-AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 
 @st.cache_resource
 def get_agentcore_client(region: str):
@@ -30,7 +33,7 @@ def get_agentcore_client(region: str):
 agentcore = get_agentcore_client(REGION)
 
 ######################################
-# actor_id / thread_id の正規化
+# actor_id / thread_id 正規化
 ######################################
 def get_actor_id_from_auth0() -> str:
     u = st.user
@@ -49,7 +52,7 @@ THREAD_ID_ALLOWED = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9\-_]*$")
 
 def normalize_actor_id(raw: str) -> str:
     """
-    ✅ FIX: 'actor:' が既に付いている場合は二重付与しない
+    'actor:' が既に付いている場合は二重付与しない
     """
     if not raw:
         raw = "anonymous"
@@ -62,12 +65,18 @@ def normalize_actor_id(raw: str) -> str:
         safe = "a_" + safe
     safe = safe.rstrip(":")
     candidate = f"actor:{safe}"
+
     if ACTOR_ID_ALLOWED.match(candidate):
         return candidate
+
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
     return f"actor:{digest}"
 
 def normalize_thread_id(raw: str) -> str:
+    """
+    thread_id(session_id) は ':' '/' を入れない。
+    'sess_' が既に付いている場合は二重付与しない
+    """
     if not raw:
         raw = "default"
     raw = str(raw).strip()
@@ -77,17 +86,20 @@ def normalize_thread_id(raw: str) -> str:
     safe = re.sub(r"[^a-zA-Z0-9\-_]", "_", raw)
     if not re.match(r"^[a-zA-Z0-9]", safe):
         safe = "t_" + safe
+
     candidate = f"sess_{safe}"
     if THREAD_ID_ALLOWED.match(candidate):
         return candidate
+
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
     return f"sess_{digest}"
 
 ######################################
-# ✅ セッション保持（表示用 messages / 実行用 runtime_session_id / Memory用 thread_id）
+# セッション状態
 ######################################
 if "messages" not in st.session_state:
-    st.session_state.messages = []  # [{"role":"user"/"assistant","content":"..."}]
+    # UI表示用: [{"role":"user"/"assistant","content":"..."}]
+    st.session_state.messages = []
 
 if "runtime_session_id" not in st.session_state:
     st.session_state.runtime_session_id = str(uuid.uuid4())
@@ -113,11 +125,11 @@ def switch_thread(thread_id: str):
     st.rerun()
 
 ######################################
-# ✅ 履歴要素の正規化（JSON丸出し＆日本語化け対策）
+# 正規化（表示用）
 ######################################
 def normalize_message_item(item):
     """
-    AgentCore側の返却揺れを吸収し、必ず {role, content} (string) に正規化する。
+    AgentCore側の返却揺れを吸収し、必ず {role, content(str)} を返す。
     対応:
     - {"role":"assistant","content":[{"text":"..."}]}
     - {"message":{"role":"assistant","content":[{"text":"..."}]}, ...}
@@ -134,23 +146,22 @@ def normalize_message_item(item):
 
     content = core.get("content")
 
-    # contentが list の場合
+    # list: [{"text":...}] / [{"toolResult":...}]
     if isinstance(content, list):
         parts = []
         for c in content:
             if not isinstance(c, dict):
-                parts.append(str(c))
                 continue
 
             # text
-            if "text" in c and isinstance(c["text"], str):
-                parts.append(c["text"])
+            t = c.get("text")
+            if isinstance(t, str) and t:
+                parts.append(t)
                 continue
 
-            # toolResult (Strandsの会話ログでよく混ざる)
+            # toolResult
             tr = c.get("toolResult")
             if isinstance(tr, dict):
-                # toolResult.content: [{"text":"..."}] を連結
                 tr_contents = tr.get("content")
                 if isinstance(tr_contents, list):
                     tr_text = "".join(
@@ -162,22 +173,42 @@ def normalize_message_item(item):
 
                 tool_name = tr.get("toolName") or tr.get("name") or "tool"
                 status = tr.get("status") or "unknown"
-                # 画面にJSONを出さないよう、テキストだけに落とす
                 parts.append(f"【ツール結果: {tool_name} / {status}】\n{tr_text}")
                 continue
 
-            # その他 dict は無視（JSON露出防止）
-            # parts.append(str(c))  ← これをやるとJSONが出るのでやらない
+        return {"role": role, "content": "".join(parts).strip()}
 
-        text = "".join(parts).strip()
-        return {"role": role, "content": text}
-
-    # contentが string / dict の場合
+    # string content
     if isinstance(content, str):
         return {"role": role, "content": content}
 
-    # dict等はJSON露出防止で空にする
     return {"role": role, "content": ""}
+
+def extract_text_from_data_string(s: str) -> str:
+    """
+    ストリーム event["data"] に JSON文字列が混ざるケースの保険。
+    JSONなら parse して text だけ抜く。JSONでないなら捨てる。
+    """
+    if not s:
+        return ""
+    ss = s.strip()
+    if ss.startswith("{") or ss.startswith("["):
+        try:
+            obj = json.loads(ss)
+            if isinstance(obj, dict):
+                m = normalize_message_item(obj)
+                return m["content"]
+            if isinstance(obj, list):
+                parts = []
+                for it in obj:
+                    m = normalize_message_item(it)
+                    if m["content"]:
+                        parts.append(m["content"])
+                return "\n".join(parts).strip()
+            return ""
+        except Exception:
+            return ""
+    return ""
 
 ######################################
 # UI
@@ -185,14 +216,6 @@ def normalize_message_item(item):
 st.title("インフルエンサー検索エージェント")
 st.write("Youtube, Instagramのインフルエンサーの情報を収集します！")
 st.write("「あなたは何ができますか？」と聞いてみてください。")
-
-# ✅ 先に表示履歴を描画（rerunしても消えない）
-for raw in st.session_state.messages:
-    m = normalize_message_item(raw)
-    if not m["content"]:
-        continue
-    with st.chat_message(m["role"]):
-        st.markdown(m["content"])
 
 ######################################
 # 前提チェック
@@ -203,10 +226,7 @@ if not AGENT_RUNTIME_ARN or not MEMORY_ID:
 
 actor_id = normalize_actor_id(get_actor_id_from_auth0())
 
-######################################
-# invoke helper
-######################################
-def invoke_json(payload_dict: dict):
+def invoke_agentcore(payload_dict: dict):
     body = json.dumps(payload_dict, ensure_ascii=False).encode("utf-8")
     return agentcore.invoke_agent_runtime(
         agentRuntimeArn=AGENT_RUNTIME_ARN,
@@ -215,55 +235,55 @@ def invoke_json(payload_dict: dict):
         qualifier="DEFAULT",
     )
 
-
 ######################################
-# 1) 初回だけ：Memoryから履歴ロード（thread_id単位）
+# 1) 履歴ロード（threadごとに1回）
 ######################################
 if st.session_state.loaded_thread_id != st.session_state.thread_id:
     try:
-        resp = invoke_json(
+        resp = invoke_agentcore(
             {
                 "action": "get_message_list",
                 "memory_id": MEMORY_ID,
                 "user_id": actor_id,
                 "session_id": st.session_state.thread_id,
+                "k": 100,
             }
         )
 
-        loaded_messages = []
+        loaded = []
 
         for line in resp["response"].iter_lines():
             if not line:
                 continue
+
             s = line.decode("utf-8")
             if not s.startswith("data: "):
                 continue
-            data = s[6:]
 
-            # keep-alive を無視
+            data = s[6:]
             if data.startswith('"') or data.startswith("'"):
                 continue
 
             obj = json.loads(data)
 
-            # obj が list / dict どちらでも処理
             if isinstance(obj, list):
                 for item in obj:
                     m = normalize_message_item(item)
                     if m["content"]:
-                        loaded_messages.append(m)
+                        loaded.append(m)
             elif isinstance(obj, dict):
+                # {"messages":[...]} 形式も吸収
                 if isinstance(obj.get("messages"), list):
                     for item in obj["messages"]:
                         m = normalize_message_item(item)
                         if m["content"]:
-                            loaded_messages.append(m)
+                            loaded.append(m)
                 else:
                     m = normalize_message_item(obj)
                     if m["content"]:
-                        loaded_messages.append(m)
+                        loaded.append(m)
 
-        st.session_state.messages = loaded_messages
+        st.session_state.messages = loaded
         st.session_state.loaded_thread_id = st.session_state.thread_id
         st.rerun()
 
@@ -272,26 +292,34 @@ if st.session_state.loaded_thread_id != st.session_state.thread_id:
         st.session_state.loaded_thread_id = st.session_state.thread_id
 
 ######################################
-# 2) チャット入力 → AgentCore invoke（ストリーミング描画）
+# 2) 表示（必ず正規化してから描画）
 ######################################
-if prompt := st.chat_input("メッセージを入力してね"):
+for raw in st.session_state.messages:
+    m = normalize_message_item(raw)
+    if not m["content"]:
+        continue
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
+
+######################################
+# 3) チャット入力 → ストリーミング（JSON混入根治）
+######################################
+prompt = st.chat_input("メッセージを入力してね")
+if prompt:
+    # 表示用に先に積む
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
+        # 日本語固定（英語寄りの抑止）
         req_payload = {
-            "prompt": prompt,
+            "prompt": f"必ず日本語で回答してください。\n\n{prompt}",
             "actor_id": actor_id,
             "session_id": st.session_state.thread_id,
         }
 
-        resp = agentcore.invoke_agent_runtime(
-            agentRuntimeArn=AGENT_RUNTIME_ARN,
-            runtimeSessionId=st.session_state.runtime_session_id,
-            payload=json.dumps(req_payload, ensure_ascii=False).encode("utf-8"),
-            qualifier="DEFAULT",
-        )
+        resp = invoke_agentcore(req_payload)
 
         container = st.container()
         text_holder = container.empty()
@@ -300,6 +328,7 @@ if prompt := st.chat_input("メッセージを入力してね"):
         for line in resp["response"].iter_lines():
             if not line:
                 continue
+
             s = line.decode("utf-8")
             if not s.startswith("data: "):
                 continue
@@ -310,7 +339,7 @@ if prompt := st.chat_input("メッセージを入力してね"):
 
             event = json.loads(data)
 
-            # ツール利用表示
+            # toolUse開始
             if "event" in event and "contentBlockStart" in event["event"]:
                 start = event["event"]["contentBlockStart"].get("start", {})
                 tool = start.get("toolUse")
@@ -321,21 +350,33 @@ if prompt := st.chat_input("メッセージを入力してね"):
                     tool_name = tool.get("name", "unknown")
                     container.info(f"🔍 {tool_name} ツールを利用しています")
                     text_holder = container.empty()
+                continue
 
-            # テキスト delta 吸収
+            # ✅ ここだけ採用（assistantのテキストdelta）
+            if "event" in event and "contentBlockDelta" in event["event"]:
+                delta = event["event"]["contentBlockDelta"].get("delta", {})
+                t = delta.get("text")
+                if isinstance(t, str) and t:
+                    buffer += t
+                    text_holder.markdown(buffer)
+                continue
+
+            # event["data"] は原則捨てる（JSON混入の根源）
+            # ただしJSON文字列ならテキストだけ抽出して採用（保険）
             if "data" in event and isinstance(event["data"], str):
-                buffer += event["data"]
-                text_holder.markdown(buffer)
-            elif "event" in event and "contentBlockDelta" in event["event"]:
-                buffer += event["event"]["contentBlockDelta"]["delta"].get("text", "")
-                text_holder.markdown(buffer)
+                extracted = extract_text_from_data_string(event["data"])
+                if extracted:
+                    buffer += extracted
+                    text_holder.markdown(buffer)
+                continue
 
         text_holder.markdown(buffer)
 
+    # 表示用履歴に積む
     st.session_state.messages.append({"role": "assistant", "content": buffer})
 
 ######################################
-# 3) サイドバー：スレッド管理
+# サイドバー：スレッド管理
 ######################################
 with st.sidebar:
     st.markdown("### Thread")
@@ -352,7 +393,7 @@ with st.sidebar:
 
     if st.button("refresh threads"):
         try:
-            resp = invoke_json(
+            resp = invoke_agentcore(
                 {
                     "action": "get_session_id_list",
                     "memory_id": MEMORY_ID,
@@ -364,29 +405,25 @@ with st.sidebar:
             for line in resp["response"].iter_lines():
                 if not line:
                     continue
+
                 s = line.decode("utf-8")
                 if not s.startswith("data: "):
                     continue
+
                 data = s[6:]
                 if data.startswith('"') or data.startswith("'"):
                     continue
 
                 obj = json.loads(data)
                 if isinstance(obj, list):
-                    ids.extend(
-                        [x.get("sessionId") for x in obj if isinstance(x, dict) and x.get("sessionId")]
-                    )
+                    for x in obj:
+                        if isinstance(x, dict) and x.get("sessionId"):
+                            ids.append(x["sessionId"])
 
-            ids = [i for i in ids if isinstance(i, str) and i]
-            st.session_state.thread_id_list = sorted(list(set(ids)))
+            st.session_state.thread_id_list = sorted(set([i for i in ids if isinstance(i, str) and i]))
 
         except Exception as e:
             st.warning(f"スレッド一覧の取得に失敗しました: {e}")
 
-    if st.session_state.thread_id_list:
-        for tid in st.session_state.thread_id_list:
-            st.button(
-                tid,
-                on_click=switch_thread,
-                args=(tid,),
-            )
+    for tid in st.session_state.thread_id_list:
+        st.button(tid, on_click=switch_thread, args=(tid,))
