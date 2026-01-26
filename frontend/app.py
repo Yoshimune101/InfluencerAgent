@@ -113,6 +113,73 @@ def switch_thread(thread_id: str):
     st.rerun()
 
 ######################################
+# ✅ 履歴要素の正規化（JSON丸出し＆日本語化け対策）
+######################################
+def normalize_message_item(item):
+    """
+    AgentCore側の返却揺れを吸収し、必ず {role, content} (string) に正規化する。
+    対応:
+    - {"role":"assistant","content":[{"text":"..."}]}
+    - {"message":{"role":"assistant","content":[{"text":"..."}]}, ...}
+    - {"message":{"role":"user","content":[{"toolResult": {...}}]}, ...}
+    """
+    if not isinstance(item, dict):
+        return {"role": "assistant", "content": str(item)}
+
+    core = item.get("message") if isinstance(item.get("message"), dict) else item
+
+    role = str(core.get("role", "assistant")).lower()
+    if role not in ("user", "assistant"):
+        role = "assistant"
+
+    content = core.get("content")
+
+    # contentが list の場合
+    if isinstance(content, list):
+        parts = []
+        for c in content:
+            if not isinstance(c, dict):
+                parts.append(str(c))
+                continue
+
+            # text
+            if "text" in c and isinstance(c["text"], str):
+                parts.append(c["text"])
+                continue
+
+            # toolResult (Strandsの会話ログでよく混ざる)
+            tr = c.get("toolResult")
+            if isinstance(tr, dict):
+                # toolResult.content: [{"text":"..."}] を連結
+                tr_contents = tr.get("content")
+                if isinstance(tr_contents, list):
+                    tr_text = "".join(
+                        (x.get("text", "") if isinstance(x, dict) else str(x))
+                        for x in tr_contents
+                    )
+                else:
+                    tr_text = str(tr_contents or "")
+
+                tool_name = tr.get("toolName") or tr.get("name") or "tool"
+                status = tr.get("status") or "unknown"
+                # 画面にJSONを出さないよう、テキストだけに落とす
+                parts.append(f"【ツール結果: {tool_name} / {status}】\n{tr_text}")
+                continue
+
+            # その他 dict は無視（JSON露出防止）
+            # parts.append(str(c))  ← これをやるとJSONが出るのでやらない
+
+        text = "".join(parts).strip()
+        return {"role": role, "content": text}
+
+    # contentが string / dict の場合
+    if isinstance(content, str):
+        return {"role": role, "content": content}
+
+    # dict等はJSON露出防止で空にする
+    return {"role": role, "content": ""}
+
+######################################
 # UI
 ######################################
 st.title("インフルエンサー検索エージェント")
@@ -120,7 +187,10 @@ st.write("Youtube, Instagramのインフルエンサーの情報を収集しま�
 st.write("「あなたは何ができますか？」と聞いてみてください。")
 
 # ✅ 先に表示履歴を描画（rerunしても消えない）
-for m in st.session_state.messages:
+for raw in st.session_state.messages:
+    m = normalize_message_item(raw)
+    if not m["content"]:
+        continue
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
@@ -145,35 +215,6 @@ def invoke_json(payload_dict: dict):
         qualifier="DEFAULT",
     )
 
-######################################
-# ✅ 履歴要素の正規化（JSON丸出し＆日本語化け対策）
-######################################
-def normalize_message_item(item):
-    """
-    AgentCore側が返す形の揺れを吸収する。
-    - {"role":"assistant","content":[{"text":"..."}]}
-    - {"message":{"role":"assistant","content":[{"text":"..."}]}, ...}
-    - content が string の場合も吸収
-    """
-    if not isinstance(item, dict):
-        return {"role": "assistant", "content": str(item)}
-
-    core = item.get("message") if isinstance(item.get("message"), dict) else item
-
-    role = str(core.get("role", "assistant")).lower()
-    if role not in ("user", "assistant"):
-        role = "assistant"
-
-    content = core.get("content")
-    if isinstance(content, list):
-        text = "".join(
-            (c.get("text", "") if isinstance(c, dict) else str(c))
-            for c in content
-        )
-    else:
-        text = str(content or "")
-
-    return {"role": role, "content": text}
 
 ######################################
 # 1) 初回だけ：Memoryから履歴ロード（thread_id単位）
@@ -212,9 +253,15 @@ if st.session_state.loaded_thread_id != st.session_state.thread_id:
                     if m["content"]:
                         loaded_messages.append(m)
             elif isinstance(obj, dict):
-                m = normalize_message_item(obj)
-                if m["content"]:
-                    loaded_messages.append(m)
+                if isinstance(obj.get("messages"), list):
+                    for item in obj["messages"]:
+                        m = normalize_message_item(item)
+                        if m["content"]:
+                            loaded_messages.append(m)
+                else:
+                    m = normalize_message_item(obj)
+                    if m["content"]:
+                        loaded_messages.append(m)
 
         st.session_state.messages = loaded_messages
         st.session_state.loaded_thread_id = st.session_state.thread_id
