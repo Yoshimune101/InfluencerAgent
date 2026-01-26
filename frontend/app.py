@@ -261,20 +261,49 @@ if "messages" not in st.session_state:
 ######################################
 # 履歴描画（サンプル踏襲）
 ######################################
+def render_message_content(content_list):
+    """
+    content の中身を人間が読める形で描画する。
+    - {"text": "..."} を表示
+    - {"toolResult": {...}} を表示（toolResult.content[].text）
+    """
+    if isinstance(content_list, list):
+        for c in content_list:
+            if not isinstance(c, dict):
+                continue
+
+            # 1) 通常テキスト
+            if isinstance(c.get("text"), str):
+                st.markdown(normalize_display_text(c["text"]))
+                continue
+
+            # 2) toolResult（ここが今回の本丸）
+            tr = c.get("toolResult")
+            if isinstance(tr, dict):
+                tr_contents = tr.get("content", [])
+                if isinstance(tr_contents, list):
+                    for tc in tr_contents:
+                        if isinstance(tc, dict) and isinstance(tc.get("text"), str):
+                            st.markdown(normalize_display_text(tc["text"]))
+                continue
+
+            # 3) それ以外（最悪フォールバック）
+            st.markdown(normalize_display_text(json.dumps(c, ensure_ascii=False)))
+
+    elif isinstance(content_list, str):
+        st.markdown(normalize_display_text(content_list))
+    else:
+        st.markdown(normalize_display_text(str(content_list)))
+
+
 for msg in st.session_state["messages"]:
     role = str(msg.get("role", "assistant")).lower()
     if role not in ("user", "assistant"):
         role = "assistant"
 
     with st.chat_message(role):
-        content_list = msg.get("content", [])
+        render_message_content(msg.get("content", []))
 
-        if isinstance(content_list, list):
-            for c in content_list:
-                if isinstance(c, dict) and isinstance(c.get("text"), str):
-                    st.write(normalize_display_text(c["text"]))  # ✅ここが肝
-        elif isinstance(content_list, str):
-            st.write(normalize_display_text(content_list))      # ✅ここも
 
 ######################################
 # チャット入力 → invoke → ストリーミング
