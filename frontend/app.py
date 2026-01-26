@@ -346,9 +346,10 @@ if prompt:
             runtimeSessionId=st.session_state["session_id"],
             payload=json.dumps(
                 {
+                    "action": "chat",
+                    "text": prompt,  # ★これが無いと返答が空になりがち
                     "memory_id": MEMORY_ID,
                     "user_id": actor_id,
-                    "text": prompt,
                     "session_id": st.session_state["session_id"],
                 },
                 ensure_ascii=False,
