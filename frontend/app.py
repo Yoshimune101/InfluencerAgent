@@ -166,31 +166,35 @@ def normalize_display_text(s: str) -> str:
 ######################################
 def streaming(response):
     """
-    AgentCore invoke_agent_runtime のSSEっぽいストリームを吸収して、
-    Streamlit の st.write_stream() 用に「差分テキストだけ」を yield する。
-
-    対応する揺れ:
-    - event.contentBlockDelta.delta.text
-    - data: {"data": "..."}  (累積 or 差分のどちらでもOKにする)
-    - toolUse 開始の通知 (contentBlockStart.start.toolUse)
-    - data: "..." のような文字列JSONは無視
+    AgentCore invoke_agent_runtime のストリームを Streamlit の st.write_stream 用に変換して流す。
+    botocore StreamingBody は iter_lines(decode_unicode=...) を受け付けない場合があるので、
+    常に bytes -> str を自前で decode する。
     """
     prev_cumulative = ""  # {"data": "..."} が累積で来る場合の差分抽出用
 
-    # chunk_sizeは小さいほど体感のストリーミングが良くなる（回線/負荷とトレードオフ）
-    for line in response["response"].iter_lines(chunk_size=1, decode_unicode=True):
+    body = response.get("response")
+    if body is None:
+        return
+
+    # iter_lines は bytes を返す前提で扱う（str が来ても吸収）
+    for line in body.iter_lines(chunk_size=1):
         if not line:
             continue
 
-        # "data: " 行だけ拾う
-        if not line.startswith("data: "):
+        # bytes / str を吸収
+        if isinstance(line, (bytes, bytearray)):
+            s = line.decode("utf-8", errors="ignore")
+        else:
+            s = str(line)
+
+        if not s.startswith("data: "):
             continue
 
-        payload = line[6:].strip()
+        payload = s[6:].strip()
         if not payload:
             continue
 
-        # data: "..." みたいな「ただのJSON文字列」は捨てる（ノイズ）
+        # data: "..." みたいな文字列JSONは捨てる（ノイズ対策）
         if (payload.startswith('"') and payload.endswith('"')) or (payload.startswith("'") and payload.endswith("'")):
             continue
 
@@ -199,7 +203,7 @@ def streaming(response):
         except Exception:
             continue
 
-        # 1) toolUse 開始を検知（表示は任意）
+        # 1) toolUse 開始通知（任意）
         tool_name = (
             obj.get("event", {})
               .get("contentBlockStart", {})
@@ -208,11 +212,10 @@ def streaming(response):
               .get("name")
         )
         if tool_name:
-            # st.write_stream は文字列を流すだけなので、インライン通知にしておく
             yield f"\n\n🔍 `{tool_name}` ツール実行中...\n\n"
             continue
 
-        # 2) 新形式: contentBlockDelta の差分テキスト
+        # 2) 新形式: contentBlockDelta の差分
         delta = (
             obj.get("event", {})
               .get("contentBlockDelta", {})
@@ -223,25 +226,25 @@ def streaming(response):
             yield delta
             continue
 
-        # 3) 旧形式: {"data": "..."}（累積/差分のどちらでも吸収）
+        # 3) 旧形式: {"data": "..."}（累積/差分どちらも吸収）
         if isinstance(obj, dict) and isinstance(obj.get("data"), str):
-            s = obj["data"]
-            if not s:
+            s2 = obj["data"]
+            if not s2:
                 continue
 
-            # 累積で来たときだけ差分を抜く（差分で来たならそのまま）
-            if s.startswith(prev_cumulative):
-                diff = s[len(prev_cumulative):]
-                prev_cumulative = s
+            # 累積なら差分を抜く
+            if s2.startswith(prev_cumulative):
+                diff = s2[len(prev_cumulative):]
+                prev_cumulative = s2
                 if diff:
                     yield diff
             else:
-                # 差分 or 揺れ。安全側でそのまま出す
-                prev_cumulative = s
-                yield s
+                # 差分/揺れはそのまま
+                prev_cumulative = s2
+                yield s2
             continue
 
-        # 4) その他（messagesなど終端メタ）は表示しない
+        # その他メタは無視
         continue
 
 
