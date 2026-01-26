@@ -252,22 +252,44 @@ def is_tool_only_message(msg: Dict[str, Any]) -> bool:
 
 
 def render_message_content(content_list: Any) -> None:
-    """
-    content の中身を人間が読める形で描画する。
-    - {"text": "..."} は markdown（JSONでも文字として扱う）
-    - {"toolResult": {...}} の toolResult.content[].text は JSONなら st.json、だめなら markdown
-    """
     if isinstance(content_list, list):
         for c in content_list:
             if not isinstance(c, dict):
                 continue
 
-            # 1) 通常テキスト：JSONでも “文字” として出す（全面JSON化を防ぐ）
+            # 1) 通常テキスト
             if isinstance(c.get("text"), str):
-                st.markdown(normalize_display_text(c["text"]))
+                txt = c["text"]
+
+                # ✅ textの中身がJSONなら、unwrapして "message.content" を再帰描画
+                parsed = try_parse_jsonish_text(txt)
+                if parsed is not None:
+                    msgs = unwrap_messages(parsed)
+                    if msgs:
+                        for mm in msgs:
+                            if isinstance(mm, dict):
+                                render_message_content(mm.get("content", []))
+                        continue
+
+                    # {"event": {"payload": "..."} } みたいなケースも保険で拾う
+                    if isinstance(parsed, dict) and isinstance(parsed.get("event"), dict):
+                        ev = parsed["event"]
+                        payload = ev.get("payload")
+                        if isinstance(payload, str):
+                            payload_obj = try_parse_jsonish_text(payload)
+                            if payload_obj is not None:
+                                msgs2 = unwrap_messages(payload_obj)
+                                if msgs2:
+                                    for mm in msgs2:
+                                        if isinstance(mm, dict):
+                                            render_message_content(mm.get("content", []))
+                                    continue
+
+                # JSONじゃなければ普通に表示
+                st.markdown(normalize_display_text(txt))
                 continue
 
-            # 2) toolResult：ここだけ JSON整形して読みやすくする
+            # 2) toolResult
             tr = c.get("toolResult")
             if isinstance(tr, dict):
                 tr_contents = tr.get("content", [])
@@ -282,13 +304,14 @@ def render_message_content(content_list: Any) -> None:
                                 st.markdown(normalize_display_text(txt))
                 continue
 
-            # 3) その他：最終フォールバック
+            # 3) その他
             st.markdown(normalize_display_text(json.dumps(c, ensure_ascii=False)))
 
     elif isinstance(content_list, str):
         st.markdown(normalize_display_text(content_list))
     else:
         st.markdown(normalize_display_text(str(content_list)))
+
 
 
 
