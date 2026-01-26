@@ -104,6 +104,63 @@ def unwrap_messages(obj):
 
     return []
 
+def _extract_text_from_message_obj(m: dict) -> str:
+    """
+    message={"role":..,"content":[{"text":"..."}]} 形式から、テキストを結合して返す
+    """
+    content = m.get("content", [])
+    if isinstance(content, list):
+        parts = []
+        for c in content:
+            if isinstance(c, dict) and isinstance(c.get("text"), str):
+                parts.append(c["text"])
+        return "\n".join([p for p in parts if p])
+    if isinstance(content, str):
+        return content
+    return ""
+
+
+def normalize_display_text(s: str) -> str:
+    """
+    画面表示用の最終正規化。
+
+    - s が JSON 文字列なら json.loads して wrapper を剥がし、本文だけ抜く
+    - \uXXXX は json.loads できれば自動で復元される
+    - それでも無理なら生文字列で返す
+    """
+    if not isinstance(s, str):
+        return str(s)
+
+    raw = s.strip()
+    # すでに普通の文章っぽければそのまま返す（無駄なパースを避ける）
+    if not raw:
+        return ""
+    if not (raw.startswith("{") or raw.startswith("[")):
+        return s
+
+    try:
+        obj = json.loads(raw)  # ← \uXXXX をここで復元できる
+    except Exception:
+        return s
+
+    # obj が {"message":{...}} や {"messages":[...]} や [ ... ] の可能性があるので既存ロジックで吸収
+    msgs = unwrap_messages(obj)
+    if not msgs:
+        # たとえば {"text":"..."} みたいな単純構造の場合
+        if isinstance(obj, dict) and isinstance(obj.get("text"), str):
+            return obj["text"]
+        return s
+
+    # 1件でも本文が取れたらそれを表示用に返す（複数なら結合）
+    texts = []
+    for m in msgs:
+        if isinstance(m, dict):
+            t = _extract_text_from_message_obj(m)
+            if t:
+                texts.append(t)
+    return "\n\n".join(texts) if texts else s
+
+
 ######################################
 # ストリーミング（サンプル踏襲）
 ######################################
@@ -178,10 +235,11 @@ if "messages" not in st.session_state:
     )
 
     # ✅ ここが核心：wrapper を剥がして messages 本体だけ保存
+    latest_msgs = None
+
     for line in response["response"].iter_lines(chunk_size=10):
         if not line:
             continue
-
         s = line.decode("utf-8")
         if not s.startswith("data: "):
             continue
@@ -192,7 +250,13 @@ if "messages" not in st.session_state:
         except Exception:
             continue
 
-        st.session_state["messages"] = unwrap_messages(obj)
+        msgs = unwrap_messages(obj)
+        if msgs:
+            latest_msgs = msgs  # ✅最後に取れた有効なmessagesを保持
+
+    if latest_msgs is not None:
+        st.session_state["messages"] = latest_msgs
+
 
 ######################################
 # 履歴描画（サンプル踏襲）
@@ -204,12 +268,13 @@ for msg in st.session_state["messages"]:
 
     with st.chat_message(role):
         content_list = msg.get("content", [])
+
         if isinstance(content_list, list):
             for c in content_list:
                 if isinstance(c, dict) and isinstance(c.get("text"), str):
-                    st.write(c["text"])
+                    st.write(normalize_display_text(c["text"]))  # ✅ここが肝
         elif isinstance(content_list, str):
-            st.write(content_list)
+            st.write(normalize_display_text(content_list))      # ✅ここも
 
 ######################################
 # チャット入力 → invoke → ストリーミング
