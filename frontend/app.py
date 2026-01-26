@@ -1,4 +1,4 @@
-import os, boto3, json, uuid
+import os, boto3, json, uuid, re, hashlib, random
 from datetime import datetime, timezone
 import streamlit as st
 from dotenv import load_dotenv
@@ -13,12 +13,12 @@ if not getattr(st.user, "is_logged_in", False):
 st.success(f"Hello {st.user.name}")
 
 ######################################
-# 環境変数と認証の設定
+# 環境変数
 ######################################
 load_dotenv()
 REGION = os.getenv("AWS_REGION")
 AGENT_RUNTIME_ARN = os.getenv("AGENT_RUNTIME_ARN")
-MEMORY_ID = os.getenv("MEMORY_ID")  # ★追加
+MEMORY_ID = os.getenv("MEMORY_ID")
 
 if not REGION:
     st.error("AWS_REGION が未設定です")
@@ -31,21 +31,100 @@ if not MEMORY_ID:
     st.stop()
 
 ######################################
-# actor_idの設定
+# ✅ actorId / sessionId の正規化（AgentCore と完全共通）
+######################################
+# 重要：Memory ListSessions が要求する actorId のパターン（ValidationExceptionのやつ）
+# - 先頭は英数字
+# - ':' を1つ含み（prefix用）、以降は [a-zA-Z0-9-/]+ が基本（'_' は不可）
+# ※末尾の許可文字はエラーメッセージがやや崩れているが、実運用では「英数字 or - or /」で終われば安全
+ACTOR_ID_ALLOWED = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9-/]*:[a-zA-Z0-9-/]+$")
+
+# sessionId はあなたの想定通り（':' '/' は不可）
+SESSION_ID_ALLOWED = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9\-_]*$")
+
+
+def normalize_actor_id(raw: str) -> str:
+    """
+    AgentCore Memory actorId 制約に合わせる。
+    - actor:<SAFE> 形式
+    - SAFE は [a-zA-Z0-9-/]+ のみ（'_' を入れない）
+    - 不正なら sha256 で必ず通す
+    """
+    if not raw:
+        raw = "anonymous"
+
+    # ':' は prefix用の1個だけにしたいので潰す
+    safe = raw.strip().replace(":", "-")
+
+    # 許可外は '-' に落とす（'_' にしない）
+    safe = re.sub(r"[^a-zA-Z0-9-/]", "-", safe)
+    safe = re.sub(r"-{2,}", "-", safe).strip("-/")
+
+    if not safe:
+        safe = "anonymous"
+    if not re.match(r"^[a-zA-Z0-9]", safe):
+        safe = "a" + safe
+
+    candidate = f"actor:{safe}"
+
+    # 末尾が '-' '/' だと危ないので補正
+    candidate = candidate.rstrip("-/")  # まず落とす
+    if candidate.endswith("actor:"):
+        candidate = "actor:anonymous"
+    if candidate.endswith("-") or candidate.endswith("/"):
+        candidate = candidate.rstrip("-/") + "a"
+
+    if ACTOR_ID_ALLOWED.match(candidate):
+        return candidate
+
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+    return f"actor:{digest}"  # 英数字のみで確実
+
+
+def normalize_session_id(raw: str) -> str:
+    """
+    - 先頭英数字
+    - 以降は [a-zA-Z0-9-_] のみ
+    """
+    if not raw:
+        raw = "default"
+
+    safe = re.sub(r"[^a-zA-Z0-9\-_]", "_", raw)
+    if not re.match(r"^[a-zA-Z0-9]", safe):
+        safe = "s_" + safe
+
+    candidate = f"sess_{safe}"
+    if SESSION_ID_ALLOWED.match(candidate):
+        return candidate
+
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+    return f"sess_{digest}"
+
+
+def generate_new_session_id(actor_id: str) -> str:
+    """
+    AgentCore 側と同じ方式で新規セッションIDを発行
+    """
+    actor_digest = hashlib.sha256(actor_id.encode("utf-8")).hexdigest()[:8]
+    ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    rnd = f"{random.randint(0, 9999):04d}"
+    return normalize_session_id(f"{actor_digest}_{ts}_{rnd}")
+
+
+######################################
+# actor_id の取得（Auth0/Streamlit）
 ######################################
 def get_actor_id_from_auth0() -> str:
-    """
-    Auth0/Streamlit の st.user から安定して一意なIDを引く。
-    優先順位: sub > id > email > name
-    """
     u = st.user
-    return (
+    raw = (
         str(getattr(u, "sub", "")).strip()
         or str(getattr(u, "id", "")).strip()
         or str(getattr(u, "email", "")).strip()
         or str(getattr(u, "name", "")).strip()
         or "anonymous"
     )
+    return normalize_actor_id(raw)
+
 
 ######################################
 # AgentCore クライアント
@@ -57,32 +136,28 @@ def get_agentcore_client(region: str):
 agentcore = get_agentcore_client(REGION)
 
 ######################################
-# ✅ セッション状態
+# ✅ セッション状態（正規化して保持）
 ######################################
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# “memory_session_id” を会話スレッドIDとして扱う
-if "memory_session_id" not in st.session_state:
-    st.session_state.memory_session_id = "default"
+if "actor_id" not in st.session_state:
+    st.session_state.actor_id = get_actor_id_from_auth0()
 
-# runtimeSessionId は「空だと即死」なので、必ず非空にする
+if "memory_session_id" not in st.session_state:
+    st.session_state.memory_session_id = normalize_session_id("default")
+
+# runtimeSessionId は必ず非空・正規化（agentcore invoke の ParamValidation を避ける）
 if "runtime_session_id" not in st.session_state or not st.session_state.runtime_session_id:
-    st.session_state.runtime_session_id = st.session_state.memory_session_id or f"rt_{uuid.uuid4().hex}"
+    st.session_state.runtime_session_id = st.session_state.memory_session_id
 
 ######################################
-# AgentCore Runtime 呼び出し（チャット専用）
+# AgentCore Runtime 呼び出し（chat のみ）
 ######################################
 def invoke_agentcore_stream(payload_obj: dict) -> tuple[list[dict], str]:
-    """
-    AgentCore Runtime を呼び出し、ストリームから
-    - meta/error を回収
-    - assistantの最終テキストを返す
-    """
-    runtime_session_id = st.session_state.get("runtime_session_id")
-    if not runtime_session_id:
-        runtime_session_id = f"rt_{uuid.uuid4().hex}"
-        st.session_state.runtime_session_id = runtime_session_id
+    runtime_session_id = st.session_state.get("runtime_session_id") or st.session_state.get("memory_session_id")
+    runtime_session_id = normalize_session_id(runtime_session_id or f"sess_{uuid.uuid4().hex}")
+    st.session_state.runtime_session_id = runtime_session_id
 
     response = agentcore.invoke_agent_runtime(
         agentRuntimeArn=AGENT_RUNTIME_ARN,
@@ -106,12 +181,12 @@ def invoke_agentcore_stream(payload_obj: dict) -> tuple[list[dict], str]:
 
         event = json.loads(data)
 
-        # control(dict) を拾う（meta/error）
+        # meta/error を回収
         if isinstance(event, dict) and event.get("type") in ("meta", "error"):
             controls.append(event)
             continue
 
-        # テキスト抽出（最小）
+        # テキスト（最低限）
         if isinstance(event, dict) and "data" in event and isinstance(event["data"], str):
             buffer += event["data"]
         elif isinstance(event, dict) and "event" in event and "contentBlockDelta" in event["event"]:
@@ -120,12 +195,9 @@ def invoke_agentcore_stream(payload_obj: dict) -> tuple[list[dict], str]:
     return controls, buffer
 
 ######################################
-# AgentCore Memory：セッション一覧取得
+# Memory：セッション一覧（公式 ListSessions）
 ######################################
 def list_memory_sessions(memory_id: str, actor_id: str, max_results: int = 100) -> list[dict]:
-    """
-    list_sessions はページングがあるので全件取得して返す
-    """
     items: list[dict] = []
     next_token = None
 
@@ -134,23 +206,28 @@ def list_memory_sessions(memory_id: str, actor_id: str, max_results: int = 100) 
         if next_token:
             kwargs["nextToken"] = next_token
 
-        res = agentcore.list_sessions(**kwargs)  # ★公式API :contentReference[oaicite:0]{index=0}
+        res = agentcore.list_sessions(**kwargs)
         items.extend(res.get("sessionSummaries", []))
         next_token = res.get("nextToken")
         if not next_token or len(items) >= max_results:
             break
 
-    # createdAt 新しい順
-    items.sort(key=lambda x: x.get("createdAt", datetime(1970, 1, 1, tzinfo=timezone.utc)), reverse=True)
+    # createdAt 新しい順（string/datetime混在を安全に）
+    def _ts(x):
+        v = x.get("createdAt")
+        if isinstance(v, datetime):
+            return v
+        return datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+    items.sort(key=_ts, reverse=True)
     return items[:max_results]
 
 ######################################
-# AgentCore Memory：会話履歴取得（sessionId単位）
+# Memory：履歴取得（公式 ListEvents）
 ######################################
-def load_memory_history(memory_id: str, actor_id: str, session_id: str, max_events: int = 200) -> list[dict]:
-    """
-    list_events -> payload.conversational から user/assistant のメッセージ配列を復元する
-    """
+def load_memory_history(memory_id: str, actor_id: str, session_id: str, max_events: int = 300) -> list[dict]:
+    session_id = normalize_session_id(session_id)
+
     events: list[dict] = []
     next_token = None
 
@@ -165,17 +242,25 @@ def load_memory_history(memory_id: str, actor_id: str, session_id: str, max_even
         if next_token:
             kwargs["nextToken"] = next_token
 
-        res = agentcore.list_events(**kwargs)  # ★公式API :contentReference[oaicite:1]{index=1}
+        res = agentcore.list_events(**kwargs)
         events.extend(res.get("events", []))
         next_token = res.get("nextToken")
         if not next_token or len(events) >= max_events:
             break
 
-    # 古い順に並べる
-    events.sort(key=lambda e: e.get("eventTimestamp", datetime(1970, 1, 1, tzinfo=timezone.utc)))
+    # 古い順
+    def _ets(e):
+        v = e.get("eventTimestamp")
+        if isinstance(v, datetime):
+            return v
+        return datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+    events.sort(key=_ets)
 
     messages: list[dict] = []
+
     for e in events:
+        # ① payload.conversational（Strands integrationが入れてくれる想定）
         payload_list = e.get("payload") or []
         for p in payload_list:
             conv = (p or {}).get("conversational")
@@ -185,31 +270,53 @@ def load_memory_history(memory_id: str, actor_id: str, session_id: str, max_even
             text = (((conv.get("content") or {}).get("text")) or "").strip()
             if not text:
                 continue
-
-            # AgentCore Memory の role は USER/ASSISTANT なので Streamlit 表示用に寄せる
             if role == "USER":
                 messages.append({"role": "user", "content": text})
             elif role == "ASSISTANT":
                 messages.append({"role": "assistant", "content": text})
-            # TOOL/OTHER はここでは捨てる（必要なら後で可視化）
+
+        # ② 互換：attributes.content 形式（あなたの旧実装）
+        attrs = e.get("attributes") or {}
+        content = attrs.get("content")
+        if content:
+            try:
+                obj = json.loads(content) if isinstance(content, str) else content
+                if isinstance(obj, list) and obj and isinstance(obj[0], dict) and "text" in obj[0]:
+                    text = "".join([x.get("text", "") for x in obj if isinstance(x, dict)]).strip()
+                elif isinstance(obj, str):
+                    text = obj.strip()
+                else:
+                    text = None
+            except Exception:
+                text = content.strip() if isinstance(content, str) else None
+
+            if text:
+                name = e.get("name") or ""
+                role = "assistant" if "assistant" in name else "user" if "user" in name else None
+                if role:
+                    messages.append({"role": role, "content": text})
 
     return messages
 
 ######################################
-# Streamlit UI
+# UI
 ######################################
 st.title("インフルエンサー検索エージェント")
 st.write("Youtube, Instagramのインフルエンサーの情報を収集します！")
 st.write("あなたは何ができますか？ と聞いてみてください。")
 
 ######################################
-# Sidebar（セッション一覧・切替）
+# Sidebar：セッション
 ######################################
 with st.sidebar:
     st.caption("セッション（AgentCore Memory）")
-    actor_id = get_actor_id_from_auth0()
 
-    # 初回ロード
+    # actor_id は毎回正規化済みを使う
+    actor_id = st.session_state.actor_id
+    if not ACTOR_ID_ALLOWED.match(actor_id):
+        st.error(f"actor_id invalid: {actor_id}")
+        st.stop()
+
     if "session_list" not in st.session_state:
         try:
             st.session_state.session_list = list_memory_sessions(MEMORY_ID, actor_id)
@@ -219,7 +326,6 @@ with st.sidebar:
 
     col1, col2 = st.columns(2)
 
-    # 一覧更新
     with col1:
         if st.button("🔄 一覧更新"):
             try:
@@ -228,22 +334,19 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"list_sessions failed: {e}")
 
-    # 新規セッション作成：Memory側は「勝手に作られる」こともあるので、
-    # ここではクライアント側で新しい session_id を採番して切替（確実に動く）
     with col2:
         if st.button("➕ 新規"):
-            new_sid = f"sess_{uuid.uuid4().hex}"
+            new_sid = generate_new_session_id(actor_id)
             st.session_state.memory_session_id = new_sid
-            st.session_state.runtime_session_id = new_sid  # 同期
+            st.session_state.runtime_session_id = new_sid
             st.session_state.messages = []
             st.rerun()
 
     sessions = st.session_state.session_list or []
-    ids = [s["sessionId"] for s in sessions] if sessions else ["default"]
-    labels = [
-        f'{s["sessionId"]}  ({s.get("createdAt","")})' for s in sessions
-    ] if sessions else ["default"]
+    ids = [s["sessionId"] for s in sessions] if sessions else [st.session_state.memory_session_id]
+    labels = [f'{s["sessionId"]}  ({s.get("createdAt","")})' for s in sessions] if sessions else [st.session_state.memory_session_id]
 
+    # 現在選択中を維持
     current_sid = st.session_state.memory_session_id if st.session_state.memory_session_id in ids else ids[0]
     current_index = ids.index(current_sid)
 
@@ -255,9 +358,9 @@ with st.sidebar:
     )
 
     if st.button("📥 開く"):
-        target_session_id = ids[selected_index]
+        target_session_id = normalize_session_id(ids[selected_index])
         st.session_state.memory_session_id = target_session_id
-        st.session_state.runtime_session_id = target_session_id  # 同期
+        st.session_state.runtime_session_id = target_session_id
 
         try:
             st.session_state.messages = load_memory_history(MEMORY_ID, actor_id, target_session_id)
@@ -284,18 +387,19 @@ if prompt := st.chat_input("メッセージを入力してね"):
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        actor_id = get_actor_id_from_auth0()
+        actor_id = st.session_state.actor_id
 
         payload_obj = {
             "op": "chat",
             "prompt": prompt,
-            "actor_id": actor_id,
-            "session_id": st.session_state.memory_session_id,
+            "actor_id": actor_id,  # ★正規化済み
+            "session_id": st.session_state.memory_session_id,  # ★正規化済み
+            "memory_id": MEMORY_ID,  # ★一致させる
         }
 
         response = agentcore.invoke_agent_runtime(
             agentRuntimeArn=AGENT_RUNTIME_ARN,
-            runtimeSessionId=st.session_state.runtime_session_id or f"rt_{uuid.uuid4().hex}",
+            runtimeSessionId=st.session_state.runtime_session_id,
             payload=json.dumps(payload_obj).encode("utf-8"),
         )
 
@@ -320,9 +424,15 @@ if prompt := st.chat_input("メッセージを入力してね"):
             if isinstance(event, dict) and event.get("type") == "meta":
                 sid = event.get("session_id")
                 if sid:
+                    sid = normalize_session_id(sid)
                     st.session_state.memory_session_id = sid
                     st.session_state.runtime_session_id = sid
+                # memory_id が返ってきたら同期（安全）
+                mid = event.get("memory_id")
+                if mid and mid != MEMORY_ID:
+                    st.warning(f"MEMORY_ID mismatch (streamlit={MEMORY_ID}, agent={mid})")
                 continue
+
             if isinstance(event, dict) and event.get("type") == "error":
                 st.error(event.get("message", "unknown error"))
                 break
@@ -333,7 +443,6 @@ if prompt := st.chat_input("メッセージを入力してね"):
                     if buffer:
                         text_holder.markdown(buffer)
                         buffer = ""
-
                     tool_name = event["event"]["contentBlockStart"]["start"]["toolUse"].get("name", "unknown")
                     container.info(f"🔍 {tool_name} ツールを利用しています")
                     text_holder = container.empty()
