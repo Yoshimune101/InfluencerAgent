@@ -31,32 +31,17 @@ if not MEMORY_ID:
     st.stop()
 
 ######################################
-# ✅ actorId / sessionId の正規化（AgentCore と完全共通）
+# ✅ actorId / sessionId の正規化（Memory用）
 ######################################
-# 重要：Memory ListSessions が要求する actorId のパターン（ValidationExceptionのやつ）
-# - 先頭は英数字
-# - ':' を1つ含み（prefix用）、以降は [a-zA-Z0-9-/]+ が基本（'_' は不可）
-# ※末尾の許可文字はエラーメッセージがやや崩れているが、実運用では「英数字 or - or /」で終われば安全
 ACTOR_ID_ALLOWED = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9-/]*:[a-zA-Z0-9-/]+$")
-
-# sessionId はあなたの想定通り（':' '/' は不可）
 SESSION_ID_ALLOWED = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9\-_]*$")
 
 
 def normalize_actor_id(raw: str) -> str:
-    """
-    AgentCore Memory actorId 制約に合わせる。
-    - actor:<SAFE> 形式
-    - SAFE は [a-zA-Z0-9-/]+ のみ（'_' を入れない）
-    - 不正なら sha256 で必ず通す
-    """
     if not raw:
         raw = "anonymous"
 
-    # ':' は prefix用の1個だけにしたいので潰す
     safe = raw.strip().replace(":", "-")
-
-    # 許可外は '-' に落とす（'_' にしない）
     safe = re.sub(r"[^a-zA-Z0-9-/]", "-", safe)
     safe = re.sub(r"-{2,}", "-", safe).strip("-/")
 
@@ -66,26 +51,18 @@ def normalize_actor_id(raw: str) -> str:
         safe = "a" + safe
 
     candidate = f"actor:{safe}"
-
-    # 末尾が '-' '/' だと危ないので補正
-    candidate = candidate.rstrip("-/")  # まず落とす
+    candidate = candidate.rstrip("-/")
     if candidate.endswith("actor:"):
         candidate = "actor:anonymous"
-    if candidate.endswith("-") or candidate.endswith("/"):
-        candidate = candidate.rstrip("-/") + "a"
 
     if ACTOR_ID_ALLOWED.match(candidate):
         return candidate
 
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
-    return f"actor:{digest}"  # 英数字のみで確実
+    return f"actor:{digest}"
 
 
 def normalize_session_id(raw: str) -> str:
-    """
-    - 先頭英数字
-    - 以降は [a-zA-Z0-9-_] のみ
-    """
     if not raw:
         raw = "default"
 
@@ -102,13 +79,26 @@ def normalize_session_id(raw: str) -> str:
 
 
 def generate_new_session_id(actor_id: str) -> str:
-    """
-    AgentCore 側と同じ方式で新規セッションIDを発行
-    """
     actor_digest = hashlib.sha256(actor_id.encode("utf-8")).hexdigest()[:8]
     ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
     rnd = f"{random.randint(0, 9999):04d}"
     return normalize_session_id(f"{actor_digest}_{ts}_{rnd}")
+
+
+######################################
+# ✅ runtimeSessionId（Runtime用）：別物なので“正規化しない”
+######################################
+# invoke_agent_runtime の runtimeSessionId は SDK が別の制約を持つことがあり、
+# Memory用 sessionId(sess_...) を流用すると ParamValidationError になりがち。
+# なので Runtime 用は rt-uuid を固定で使う。
+RUNTIME_SID_ALLOWED = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-]{7,}$")
+
+
+def ensure_runtime_session_id(raw: str | None) -> str:
+    if raw and isinstance(raw, str) and RUNTIME_SID_ALLOWED.match(raw):
+        return raw
+    # UUIDのハイフン形式はだいたいのSDK制約で通る
+    return f"rt-{uuid.uuid4()}"
 
 
 ######################################
@@ -136,7 +126,7 @@ def get_agentcore_client(region: str):
 agentcore = get_agentcore_client(REGION)
 
 ######################################
-# ✅ セッション状態（正規化して保持）
+# ✅ セッション状態
 ######################################
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -144,55 +134,17 @@ if "messages" not in st.session_state:
 if "actor_id" not in st.session_state:
     st.session_state.actor_id = get_actor_id_from_auth0()
 
+# Memory用（履歴キー）
 if "memory_session_id" not in st.session_state:
     st.session_state.memory_session_id = normalize_session_id("default")
+else:
+    st.session_state.memory_session_id = normalize_session_id(st.session_state.memory_session_id)
 
-# runtimeSessionId は必ず非空・正規化（agentcore invoke の ParamValidation を避ける）
-if "runtime_session_id" not in st.session_state or not st.session_state.runtime_session_id:
-    st.session_state.runtime_session_id = st.session_state.memory_session_id
-
-######################################
-# AgentCore Runtime 呼び出し（chat のみ）
-######################################
-def invoke_agentcore_stream(payload_obj: dict) -> tuple[list[dict], str]:
-    runtime_session_id = st.session_state.get("runtime_session_id") or st.session_state.get("memory_session_id")
-    runtime_session_id = normalize_session_id(runtime_session_id or f"sess_{uuid.uuid4().hex}")
-    st.session_state.runtime_session_id = runtime_session_id
-
-    response = agentcore.invoke_agent_runtime(
-        agentRuntimeArn=AGENT_RUNTIME_ARN,
-        runtimeSessionId=runtime_session_id,
-        payload=json.dumps(payload_obj).encode("utf-8"),
-    )
-
-    controls: list[dict] = []
-    buffer = ""
-
-    for line in response["response"].iter_lines():
-        if not line:
-            continue
-        s = line.decode("utf-8")
-        if not s.startswith("data: "):
-            continue
-
-        data = s[6:]
-        if data.startswith('"') or data.startswith("'"):
-            continue
-
-        event = json.loads(data)
-
-        # meta/error を回収
-        if isinstance(event, dict) and event.get("type") in ("meta", "error"):
-            controls.append(event)
-            continue
-
-        # テキスト（最低限）
-        if isinstance(event, dict) and "data" in event and isinstance(event["data"], str):
-            buffer += event["data"]
-        elif isinstance(event, dict) and "event" in event and "contentBlockDelta" in event["event"]:
-            buffer += event["event"]["contentBlockDelta"]["delta"].get("text", "")
-
-    return controls, buffer
+# Runtime用（接続キー）：固定（以後、絶対に Memory と同期しない）
+if "runtime_session_id" not in st.session_state:
+    st.session_state.runtime_session_id = ensure_runtime_session_id(None)
+else:
+    st.session_state.runtime_session_id = ensure_runtime_session_id(st.session_state.runtime_session_id)
 
 ######################################
 # Memory：セッション一覧（公式 ListSessions）
@@ -212,7 +164,6 @@ def list_memory_sessions(memory_id: str, actor_id: str, max_results: int = 100) 
         if not next_token or len(items) >= max_results:
             break
 
-    # createdAt 新しい順（string/datetime混在を安全に）
     def _ts(x):
         v = x.get("createdAt")
         if isinstance(v, datetime):
@@ -248,7 +199,6 @@ def load_memory_history(memory_id: str, actor_id: str, session_id: str, max_even
         if not next_token or len(events) >= max_events:
             break
 
-    # 古い順
     def _ets(e):
         v = e.get("eventTimestamp")
         if isinstance(v, datetime):
@@ -260,7 +210,7 @@ def load_memory_history(memory_id: str, actor_id: str, session_id: str, max_even
     messages: list[dict] = []
 
     for e in events:
-        # ① payload.conversational（Strands integrationが入れてくれる想定）
+        # ① payload.conversational（Strands integration想定）
         payload_list = e.get("payload") or []
         for p in payload_list:
             conv = (p or {}).get("conversational")
@@ -275,7 +225,7 @@ def load_memory_history(memory_id: str, actor_id: str, session_id: str, max_even
             elif role == "ASSISTANT":
                 messages.append({"role": "assistant", "content": text})
 
-        # ② 互換：attributes.content 形式（あなたの旧実装）
+        # ② 互換：attributes.content 形式
         attrs = e.get("attributes") or {}
         content = attrs.get("content")
         if content:
@@ -311,11 +261,16 @@ st.write("あなたは何ができますか？ と聞いてみてください。
 with st.sidebar:
     st.caption("セッション（AgentCore Memory）")
 
-    # actor_id は毎回正規化済みを使う
     actor_id = st.session_state.actor_id
     if not ACTOR_ID_ALLOWED.match(actor_id):
         st.error(f"actor_id invalid: {actor_id}")
         st.stop()
+
+    # デバッグ（問題が出る時だけ表示したいならコメントアウト）
+    st.caption("debug")
+    st.write("actor_id:", repr(actor_id))
+    st.write("memory_session_id:", repr(st.session_state.memory_session_id))
+    st.write("runtime_session_id:", repr(st.session_state.runtime_session_id))
 
     if "session_list" not in st.session_state:
         try:
@@ -336,9 +291,9 @@ with st.sidebar:
 
     with col2:
         if st.button("➕ 新規"):
+            # ✅ Memoryセッションだけ切り替える。Runtimeは固定。
             new_sid = generate_new_session_id(actor_id)
             st.session_state.memory_session_id = new_sid
-            st.session_state.runtime_session_id = new_sid
             st.session_state.messages = []
             st.rerun()
 
@@ -346,7 +301,6 @@ with st.sidebar:
     ids = [s["sessionId"] for s in sessions] if sessions else [st.session_state.memory_session_id]
     labels = [f'{s["sessionId"]}  ({s.get("createdAt","")})' for s in sessions] if sessions else [st.session_state.memory_session_id]
 
-    # 現在選択中を維持
     current_sid = st.session_state.memory_session_id if st.session_state.memory_session_id in ids else ids[0]
     current_index = ids.index(current_sid)
 
@@ -358,9 +312,9 @@ with st.sidebar:
     )
 
     if st.button("📥 開く"):
+        # ✅ Memoryセッションだけ切り替える。Runtimeは固定。
         target_session_id = normalize_session_id(ids[selected_index])
         st.session_state.memory_session_id = target_session_id
-        st.session_state.runtime_session_id = target_session_id
 
         try:
             st.session_state.messages = load_memory_history(MEMORY_ID, actor_id, target_session_id)
@@ -368,7 +322,7 @@ with st.sidebar:
         except Exception as e:
             st.error(f"load history failed: {e}")
 
-    st.caption("現在のセッションID")
+    st.caption("現在のセッションID（Memory）")
     st.code(st.session_state.memory_session_id, language="text")
 
 ######################################
@@ -392,11 +346,12 @@ if prompt := st.chat_input("メッセージを入力してね"):
         payload_obj = {
             "op": "chat",
             "prompt": prompt,
-            "actor_id": actor_id,  # ★正規化済み
-            "session_id": st.session_state.memory_session_id,  # ★正規化済み
-            "memory_id": MEMORY_ID,  # ★一致させる
+            "actor_id": actor_id,  # Memory制約に合わせた actorId
+            "session_id": st.session_state.memory_session_id,  # Memory用 sessionId
+            "memory_id": MEMORY_ID,
         }
 
+        # ✅ runtimeSessionId は固定（rt-uuid）
         response = agentcore.invoke_agent_runtime(
             agentRuntimeArn=AGENT_RUNTIME_ARN,
             runtimeSessionId=st.session_state.runtime_session_id,
@@ -422,12 +377,11 @@ if prompt := st.chat_input("メッセージを入力してね"):
 
             # meta / error
             if isinstance(event, dict) and event.get("type") == "meta":
+                # ✅ Memoryセッションだけ同期（Runtimeは触らない）
                 sid = event.get("session_id")
                 if sid:
-                    sid = normalize_session_id(sid)
-                    st.session_state.memory_session_id = sid
-                    st.session_state.runtime_session_id = sid
-                # memory_id が返ってきたら同期（安全）
+                    st.session_state.memory_session_id = normalize_session_id(sid)
+
                 mid = event.get("memory_id")
                 if mid and mid != MEMORY_ID:
                     st.warning(f"MEMORY_ID mismatch (streamlit={MEMORY_ID}, agent={mid})")
