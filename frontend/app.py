@@ -26,6 +26,10 @@ REGION = os.getenv("AWS_REGION") or "us-west-2"
 AGENT_RUNTIME_ARN = os.getenv("AGENT_RUNTIME_ARN")
 MEMORY_ID = os.getenv("MEMORY_ID")
 
+if not AGENT_RUNTIME_ARN or not MEMORY_ID:
+    st.error("環境変数 AGENT_RUNTIME_ARN と MEMORY_ID が未設定です。")
+    st.stop()
+
 ######################################
 # AgentCore Client
 ######################################
@@ -64,11 +68,12 @@ def normalize_actor_id(raw: str) -> str:
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
     return f"actor:{digest}"
 
+actor_id = normalize_actor_id(get_actor_id_from_auth0())
+
 ######################################
-# Session ID（サンプル踏襲：33文字以上）
+# Session ID（33文字以上想定）
 ######################################
-def generate_session_id():
-    # 33文字以上ないとエラーになる、という前提に合わせる
+def generate_session_id() -> str:
     return str(int(time.time())) + "_" + str(uuid.uuid4()).replace("-", "")
 
 if "session_id" not in st.session_state:
@@ -79,19 +84,13 @@ if "session_id" not in st.session_state:
 ######################################
 def unwrap_messages(obj):
     """
-    AgentCoreから返るログの揺れを吸収して
-    messages=[{"role": "...", "content":[{"text":"..."}]}] の形に寄せる。
-
-    想定される返却:
-    - [{"message": {...}, "created_at":...}, ...]  ← あなたが見てるJSON
-    - {"messages":[...]}
-    - [{"role":"user","content":[{"text":"..."}]}, ...]
+    messages=[{"role": "...", "content":[{"text":"..."}]}] に寄せる
     """
     if isinstance(obj, list):
         out = []
         for x in obj:
             if isinstance(x, dict) and isinstance(x.get("message"), dict):
-                out.append(x["message"])  # ✅ wrapper を剥がす
+                out.append(x["message"])
             elif isinstance(x, dict) and ("role" in x and "content" in x):
                 out.append(x)
         return out
@@ -105,9 +104,6 @@ def unwrap_messages(obj):
     return []
 
 def _extract_text_from_message_obj(m: dict) -> str:
-    """
-    message={"role":..,"content":[{"text":"..."}]} 形式から、テキストを結合して返す
-    """
     content = m.get("content", [])
     if isinstance(content, list):
         parts = []
@@ -119,39 +115,27 @@ def _extract_text_from_message_obj(m: dict) -> str:
         return content
     return ""
 
-
 def normalize_display_text(s: str) -> str:
-    """
-    画面表示用の最終正規化。
-
-    - s が JSON 文字列なら json.loads して wrapper を剥がし、本文だけ抜く
-    - \uXXXX は json.loads できれば自動で復元される
-    - それでも無理なら生文字列で返す
-    """
     if not isinstance(s, str):
         return str(s)
 
     raw = s.strip()
-    # すでに普通の文章っぽければそのまま返す（無駄なパースを避ける）
     if not raw:
         return ""
     if not (raw.startswith("{") or raw.startswith("[")):
         return s
 
     try:
-        obj = json.loads(raw)  # ← \uXXXX をここで復元できる
+        obj = json.loads(raw)
     except Exception:
         return s
 
-    # obj が {"message":{...}} や {"messages":[...]} や [ ... ] の可能性があるので既存ロジックで吸収
     msgs = unwrap_messages(obj)
     if not msgs:
-        # たとえば {"text":"..."} みたいな単純構造の場合
         if isinstance(obj, dict) and isinstance(obj.get("text"), str):
             return obj["text"]
         return s
 
-    # 1件でも本文が取れたらそれを表示用に返す（複数なら結合）
     texts = []
     for m in msgs:
         if isinstance(m, dict):
@@ -160,29 +144,69 @@ def normalize_display_text(s: str) -> str:
                 texts.append(t)
     return "\n\n".join(texts) if texts else s
 
+######################################
+# ストリーム行読み取り（requests/botocore両対応）
+######################################
+def _iter_lines_any(body, chunk_size: int = 10):
+    """
+    - requests.Response.iter_lines(...) でも
+    - botocore.response.StreamingBody.iter_lines(...) でも
+    どちらでも読めるようにする互換層
+    """
+    # requests は decode_unicode を受けるが botocore は受けない
+    try:
+        it = body.iter_lines(chunk_size=chunk_size, decode_unicode=False)
+    except TypeError:
+        it = body.iter_lines(chunk_size=chunk_size)
+
+    for line in it:
+        if line is None:
+            continue
+        if isinstance(line, bytes):
+            s = line.decode("utf-8", errors="ignore")
+        else:
+            s = str(line)
+        yield s
 
 ######################################
-# ストリーミング（サンプル踏襲）
+# SSE (data: ...) パース
 ######################################
-def streaming(response):
+def _iter_sse_json(response: dict, chunk_size: int = 10):
     """
-    invoke_agent_runtime のストリームを処理。
-    「テキスト delta」だけ表示する（JSONは表示しない）。
+    AgentCoreの返却ストリームが
+      data: {...}\n
+    のような SSE 形式で流れてくる想定で JSON を取り出す
     """
-    for line in response["response"].iter_lines(chunk_size=10):
-        if not line:
+    body = response.get("response")
+    if body is None:
+        return
+
+    for s in _iter_lines_any(body, chunk_size=chunk_size):
+        if not s:
+            continue
+        s = s.strip()
+        if not s.startswith("data:"):
             continue
 
-        s = line.decode("utf-8")
-        if not s.startswith("data: "):
+        payload = s[5:].strip()  # remove "data:"
+        if not payload:
             continue
 
-        payload = s[6:]  # remove "data: "
         try:
             obj = json.loads(payload)
+            yield obj
         except Exception:
+            # 途中フレーム/ゴミは捨てる
             continue
 
+######################################
+# ストリーミング（テキスト delta のみ）
+######################################
+def streaming(invoke_response: dict):
+    """
+    invoke_agent_runtime のストリームを処理し、テキストだけ yield
+    """
+    for obj in _iter_sse_json(invoke_response, chunk_size=10):
         text = (
             obj.get("event", {})
               .get("contentBlockDelta", {})
@@ -193,12 +217,12 @@ def streaming(response):
             yield text
 
 ######################################
-# thread 切り替え（サンプル踏襲）
+# thread 切り替え
 ######################################
 def set_session_id(session_id: str):
     st.session_state["session_id"] = session_id
-    if "messages" in st.session_state:
-        del st.session_state["messages"]
+    # 表示用ログをクリア（必要なら保持戦略に変えてOK）
+    st.session_state["messages"] = []
 
 ######################################
 # UI
@@ -207,19 +231,13 @@ st.title("インフルエンサー検索エージェント")
 st.write("Youtube, Instagramのインフルエンサーの情報を収集します！")
 st.write("「あなたは何ができますか？」と聞いてみてください。")
 
-if not AGENT_RUNTIME_ARN or not MEMORY_ID:
-    st.error("環境変数 AGENT_RUNTIME_ARN と MEMORY_ID が未設定です。")
-    st.stop()
-
-actor_id = normalize_actor_id(get_actor_id_from_auth0())
-
 ######################################
-# 初回：messagesをロード（サンプル踏襲）
+# 初回：messagesをロード（過去履歴）
 ######################################
 if "messages" not in st.session_state:
     st.session_state["messages"] = []
 
-    response = agent_core_client.invoke_agent_runtime(
+    resp = agent_core_client.invoke_agent_runtime(
         agentRuntimeArn=AGENT_RUNTIME_ARN,
         runtimeSessionId=st.session_state["session_id"],
         payload=json.dumps(
@@ -234,32 +252,17 @@ if "messages" not in st.session_state:
         qualifier="DEFAULT",
     )
 
-    # ✅ ここが核心：wrapper を剥がして messages 本体だけ保存
     latest_msgs = None
-
-    for line in response["response"].iter_lines(chunk_size=10):
-        if not line:
-            continue
-        s = line.decode("utf-8")
-        if not s.startswith("data: "):
-            continue
-
-        payload = s[6:]
-        try:
-            obj = json.loads(payload)
-        except Exception:
-            continue
-
+    for obj in _iter_sse_json(resp, chunk_size=10):
         msgs = unwrap_messages(obj)
         if msgs:
-            latest_msgs = msgs  # ✅最後に取れた有効なmessagesを保持
+            latest_msgs = msgs
 
     if latest_msgs is not None:
         st.session_state["messages"] = latest_msgs
 
-
 ######################################
-# 履歴描画（サンプル踏襲）
+# 履歴描画
 ######################################
 for msg in st.session_state["messages"]:
     role = str(msg.get("role", "assistant")).lower()
@@ -272,9 +275,9 @@ for msg in st.session_state["messages"]:
         if isinstance(content_list, list):
             for c in content_list:
                 if isinstance(c, dict) and isinstance(c.get("text"), str):
-                    st.write(normalize_display_text(c["text"]))  # ✅ここが肝
+                    st.write(normalize_display_text(c["text"]))
         elif isinstance(content_list, str):
-            st.write(normalize_display_text(content_list))      # ✅ここも
+            st.write(normalize_display_text(content_list))
 
 ######################################
 # チャット入力 → invoke → ストリーミング
@@ -284,12 +287,14 @@ if prompt:
     with st.chat_message("user"):
         st.write(prompt)
 
-    with st.spinner():
-        response = agent_core_client.invoke_agent_runtime(
+    with st.spinner("AgentCore実行中..."):
+        # ここで prompt を payload に載せる（あなた側のRuntime実装に合わせてキー名調整可）
+        resp = agent_core_client.invoke_agent_runtime(
             agentRuntimeArn=AGENT_RUNTIME_ARN,
             runtimeSessionId=st.session_state["session_id"],
             payload=json.dumps(
                 {
+                    "prompt": prompt,          # ← 重要：ユーザ入力
                     "memory_id": MEMORY_ID,
                     "user_id": actor_id,
                     "session_id": st.session_state["session_id"],
@@ -300,22 +305,22 @@ if prompt:
         )
 
         with st.chat_message("assistant"):
-            assistant_message = st.write_stream(streaming(response))
+            assistant_message = st.write_stream(streaming(resp))
 
-    # ✅ messagesはサンプル形式に統一して追記
+    # 表示ログに追記（role/content 形式を維持）
     st.session_state["messages"].append({"role": "user", "content": [{"text": prompt}]})
     st.session_state["messages"].append(
-        {"role": "assistant", "content": [{"text": assistant_message}]}
+        {"role": "assistant", "content": [{"text": assistant_message or ""}]}
     )
 
-    # session_id_list に自分を追加（サンプル踏襲）
+    # session_id_list に自分を追加
     if "session_id_list" not in st.session_state:
         st.session_state["session_id_list"] = []
     if st.session_state["session_id"] not in st.session_state["session_id_list"]:
         st.session_state["session_id_list"].append(st.session_state["session_id"])
 
 ######################################
-# サイドバー：スレッド管理（サンプル踏襲）
+# サイドバー：スレッド管理
 ######################################
 with st.sidebar:
     st.text_input(label="Session ID", value=st.session_state["session_id"], disabled=True)
@@ -329,8 +334,9 @@ with st.sidebar:
 
     # session_id_list 初回取得
     if "session_id_list" not in st.session_state:
-        with st.spinner():
-            response = agent_core_client.invoke_agent_runtime(
+        st.session_state["session_id_list"] = []
+        with st.spinner("セッション一覧取得中..."):
+            resp = agent_core_client.invoke_agent_runtime(
                 agentRuntimeArn=AGENT_RUNTIME_ARN,
                 runtimeSessionId=st.session_state["session_id"],
                 payload=json.dumps(
@@ -344,21 +350,8 @@ with st.sidebar:
                 qualifier="DEFAULT",
             )
 
-            for line in response["response"].iter_lines(chunk_size=10):
-                if not line:
-                    continue
-
-                s = line.decode("utf-8")
-                if not s.startswith("data: "):
-                    continue
-
-                payload = s[6:]
-                try:
-                    obj = json.loads(payload)
-                except Exception:
-                    continue
-
-                # 期待: [{"sessionId":"..."}...]
+            # 期待: [{"sessionId":"..."}...]
+            for obj in _iter_sse_json(resp, chunk_size=10):
                 if isinstance(obj, list):
                     st.session_state["session_id_list"] = [
                         x["sessionId"]
@@ -366,6 +359,6 @@ with st.sidebar:
                         if isinstance(x, dict) and x.get("sessionId")
                     ]
 
-    if "session_id_list" in st.session_state:
-        for sid in st.session_state["session_id_list"]:
-            st.button(sid, on_click=set_session_id, args=[sid])
+    # セッションボタン
+    for sid in st.session_state.get("session_id_list", []):
+        st.button(sid, on_click=set_session_id, args=[sid])
